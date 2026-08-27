@@ -11,10 +11,14 @@ use crate::state::AppState;
 use crate::stt::SttSidecar;
 use crate::transcript::{InterviewSession, RecordingState, TranscriptSegment};
 
+// `pub(crate)`, not private: `voice_command::mod` also emits this same event
+// shape from the mic-assistant pump (see its doc), so both capture paths
+// (system-audio here, mic-assistant there) produce one consistent
+// `audio:level` event the frontend can listen to regardless of source.
 #[derive(Clone, serde::Serialize)]
-struct AudioLevelEvent {
-    source: AudioSource,
-    rms_level: f32,
+pub(crate) struct AudioLevelEvent {
+    pub(crate) source: AudioSource,
+    pub(crate) rms_level: f32,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -235,6 +239,7 @@ fn start_capture_inner(app: &tauri::AppHandle, state: &State<'_, AppState>) -> R
 
     let app_for_pipeline = app.clone();
     let pause_for_pipeline = pause.clone();
+    let tts_speaking_for_pipeline = state.tts_speaking.clone();
 
     // ===== TEMP DIAGNOSTIC INSTRUMENTATION — STT latency investigation =====
     // Gated behind STT_DIAG=1 (OFF by default): read-only logging, changes no
@@ -347,7 +352,7 @@ fn start_capture_inner(app: &tauri::AppHandle, state: &State<'_, AppState>) -> R
 
             // The loop itself lives in `audio::pipeline` so that the headless
             // `pipeline_test` binary drives the same code rather than a copy.
-            crate::audio::run_stt_pipeline(audio_rx, sidecar, pause_for_pipeline, move |chunk| {
+            crate::audio::run_stt_pipeline(audio_rx, sidecar, pause_for_pipeline, Some(tts_speaking_for_pipeline), move |chunk| {
                 let _ = app_for_pipeline.emit(
                     "audio:level",
                     AudioLevelEvent {

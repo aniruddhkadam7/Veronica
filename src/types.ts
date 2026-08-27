@@ -29,6 +29,30 @@ export interface RecordingStateEvent {
   state: RecordingState;
 }
 
+/// Real pipeline state events the orb widgets (VeronicaWidget.tsx,
+/// VeronicaOverlay.tsx) subscribe to. Each is emitted from the actual
+/// point in the Rust-side pipeline where that state genuinely begins/ends
+/// — see veronica.rs, voice_command/mod.rs, stt/sidecar.rs, tts/mod.rs —
+/// not inferred/faked client-side timers.
+///
+/// "veronica:thinking-start": () — emitted at the top of ask_veronica,
+///   before retrieval/LLM work starts. Ends implicitly on the first
+///   "veronica:answer-delta" or on "veronica:answer-complete"/an ask_veronica
+///   command rejection.
+/// "veronica:action-start": string — emitted right before a parsed ACTION
+///   directive (OpenApp/OpenFile/OpenFolder/OpenUrl/QuerySystemInfo) runs;
+///   payload is that Intent's fixed Debug label, never model free text.
+/// "veronica:action-complete": () — emitted right after that action finishes.
+/// "tts:speaking-changed": boolean — real mute-signal transition from the
+///   mic-assistant pump (voice_command::mod), which already polls
+///   TtsSpeakingSignal at mic-chunk cadence to decide whether to withhold
+///   audio from STT; piggybacked here rather than adding a new poller.
+/// "veronica:error": string — a human-readable message for a background-
+///   thread failure with no other path to the frontend: STT sidecar crash/
+///   error after startup, a per-utterance Groq transcription failure, or a
+///   per-sentence Deepgram TTS failure.
+export type VeronicaErrorEvent = string;
+
 export type BackendStatus = "UNKNOWN" | "CONNECTING" | "CONNECTED" | "OFFLINE";
 
 export type AnalysisPhase = "IDLE" | "ANALYZING" | "COMPLETED" | "FAILED";

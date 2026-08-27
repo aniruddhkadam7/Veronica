@@ -20,6 +20,12 @@ export interface OverlaySettings {
   answerLength: AnswerLength;
   responseStyle: ResponseStyle;
   humanization: Humanization;
+  // Speaks each answer aloud via Deepgram Cloud TTS (Aura-1) as it streams
+  // in — see veronica::ask_veronica's tts_enabled option. Off by default:
+  // voice output is opt-in, matching the general no-surprise-network-calls
+  // posture elsewhere in this app (RAG retrieval, cloud LLM calls are all
+  // already deliberate per-question choices, not always-on).
+  voiceOutputEnabled: boolean;
 }
 
 export const DEFAULT_OVERLAY_SETTINGS: OverlaySettings = {
@@ -32,6 +38,7 @@ export const DEFAULT_OVERLAY_SETTINGS: OverlaySettings = {
   answerLength: "default",
   responseStyle: "natural",
   humanization: "natural",
+  voiceOutputEnabled: false,
 };
 
 /// Fraction of the primary monitor's shorter dimension the overlay window

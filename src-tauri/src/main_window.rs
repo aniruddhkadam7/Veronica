@@ -92,6 +92,32 @@ pub fn set_popover_content_height(_app: AppHandle, _content_height: f64) -> Resu
 /// no-op — not an error — on Windows 10, which predates this DWM API);
 /// failures are logged, never fatal, since this is a cosmetic touch, not
 /// functional.
+/// Turns off DWM's default accent-colored 1px window border (see
+/// `suppress_window_border`'s doc) and nothing else — used by chrome-less
+/// windows that have no native titlebar to also re-color (unlike the main
+/// window's `apply_light_titlebar`, which does both). Currently used by the
+/// Veronica widget window (`veronica_widget.rs`), where this border was
+/// especially visible: a tiny, fully transparent window with only a round
+/// glowing orb inside made DWM's thin square outline read as an obvious box
+/// drawn around the circle.
+pub fn suppress_window_border(window: &tauri::WebviewWindow) {
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+    unsafe {
+        let border = COLORREF(DWMWA_COLOR_NONE);
+        if let Err(e) = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        ) {
+            log::warn!("failed to suppress window border color (expected on Windows 10): {e}");
+        }
+    }
+}
+
 pub fn apply_light_titlebar(app: &AppHandle) {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
         return;
@@ -103,7 +129,6 @@ pub fn apply_light_titlebar(app: &AppHandle) {
     // COLORREF is 0x00BBGGRR, not 0x00RRGGBB.
     const CAPTION_COLOR: u32 = 0x00FFFFFF; // #ffffff, R=G=B=0xff so byte order doesn't matter here
     const TEXT_COLOR: u32 = 0x001C1817; // #17181c
-    const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
 
     unsafe {
         let caption = COLORREF(CAPTION_COLOR);
@@ -124,14 +149,6 @@ pub fn apply_light_titlebar(app: &AppHandle) {
         ) {
             log::warn!("failed to set title bar text color (expected on Windows 10): {e}");
         }
-        let border = COLORREF(DWMWA_COLOR_NONE);
-        if let Err(e) = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &border as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<COLORREF>() as u32,
-        ) {
-            log::warn!("failed to suppress window border color (expected on Windows 10): {e}");
-        }
     }
+    suppress_window_border(&window);
 }

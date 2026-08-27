@@ -1,24 +1,24 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use tauri::{path::BaseDirectory, AppHandle, Manager};
 
-use crate::audio::AudioSource;
+use crate::audio::{AudioSource, TARGET_SAMPLE_RATE};
 use crate::process_util::hidden_command;
 
 use super::events::{SidecarLine, SttEvent, SttEventKind};
+use super::groq;
 
-/// How long `SttSidecar::spawn` will wait for the sidecar to signal
+/// How long `SttSidecar::spawn` will wait for the local VAD engine to signal
 /// `{"type":"ready"}` (or an error, or exit) before giving up. Overridable
-/// via `STT_READY_TIMEOUT_MS`, same pattern as the sidecar's other tuning
-/// knobs (`STT_NUM_THREADS`, `STT_END_SILENCE_MS`, ...) — the default is
-/// generous relative to normal model-load time (typically a couple of
-/// seconds) specifically to tolerate a slower load under CPU/memory
-/// contention on constrained hardware, without leaving a genuinely hung
-/// process waiting forever.
+/// via `STT_READY_TIMEOUT_MS` — the default is generous relative to normal
+/// model-load time (typically a couple of seconds) specifically to tolerate
+/// a slower load under CPU/memory contention on constrained hardware,
+/// without leaving a genuinely hung process waiting forever.
 fn ready_timeout() -> Duration {
     std::env::var("STT_READY_TIMEOUT_MS")
         .ok()
@@ -27,78 +27,25 @@ fn ready_timeout() -> Duration {
         .unwrap_or(Duration::from_millis(20_000))
 }
 
-/// Locates a working Python 3 interpreter. Tries `py -3` first (the standard Windows
-/// launcher, which resolves correctly even when bare `python`/`python3` are shadowed
-/// by the Microsoft Store app-execution-alias stub — see docs/architecture.md), then
-/// falls back to `python`.
-fn find_python() -> Option<(String, Vec<String>)> {
-    if hidden_command("py")
-        .args(["-3", "--version"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return Some(("py".to_string(), vec!["-3".to_string()]));
-    }
-    if hidden_command("python")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return Some(("python".to_string(), vec![]));
-    }
-    None
-}
-
 fn stt_package_dir() -> std::path::PathBuf {
     // In dev, CARGO_MANIFEST_DIR is src-tauri; this personal repo's flat
-    // layout has no packages/stt monorepo tree — only the prebuilt sidecar
-    // (sidecars/stt-sidecar/) and model (models/stt/) at the repo root, one
-    // level up. There is no dev-tree venv/script path in this repo at all
-    // (script_path()/stt_venv_python() below will simply never resolve to
-    // anything that exists), so this function only matters for locating the
-    // prebuilt sidecar/model in dev mode.
+    // layout has no packages/stt monorepo tree — the dev-tree VAD-engine
+    // source (streaming_asr_sidecar/), its venv (streaming_asr_sidecar/.venv),
+    // the prebuilt frozen sidecar (sidecars/stt-sidecar/), and the model
+    // (models/stt/) all live directly at the repo root, one level up.
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
 }
 
-/// Which local engine the sidecar should run.
-///
-/// `StreamingAsr` (sherpa-onnx / NeMo FastConformer 80ms) is the production
-/// engine as of the benchmark in `docs/stt-benchmark.md`. PocketSphinx is kept
-/// reachable via `STT_ENGINE=pocketsphinx` so the two can be compared on the
-/// same machine without a rebuild, and so there is a fallback if the streaming
-/// venv is ever missing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SttEngineKind {
-    StreamingAsr,
-    PocketSphinx,
+fn script_path() -> std::path::PathBuf {
+    stt_package_dir().join("streaming_asr_sidecar").join("sidecar.py")
 }
 
-impl SttEngineKind {
-    fn from_env() -> Self {
-        match std::env::var("STT_ENGINE").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-            "pocketsphinx" | "sphinx" => Self::PocketSphinx,
-            _ => Self::StreamingAsr,
-        }
-    }
-
-    fn script_path(self) -> std::path::PathBuf {
-        let base = stt_package_dir();
-        match self {
-            Self::StreamingAsr => base.join("streaming_asr_sidecar").join("sidecar.py"),
-            Self::PocketSphinx => base.join("pocketsphinx_sidecar").join("sidecar.py"),
-        }
-    }
-}
-
-/// The STT sidecar's own virtualenv interpreter. sherpa-onnx and its ONNX
-/// Runtime dependency are heavy enough to deserve isolation, mirroring how
-/// `packages/rag` and `apps/backend` each own a venv rather than sharing one.
+/// The local VAD engine's own virtualenv interpreter, at
+/// `streaming_asr_sidecar/.venv` (repo root, sibling to `models/` and
+/// `sidecars/` in this flat personal repo — there is no `packages/stt`
+/// monorepo tree here). sherpa-onnx and its ONNX Runtime dependency are
+/// heavy enough to deserve isolation from any other Python tooling on the
+/// dev machine.
 ///
 /// Only meaningful in dev: a plain venv is not relocatable (its `python.exe`
 /// hardcodes the absolute path of the base Python install it was created
@@ -107,6 +54,7 @@ impl SttEngineKind {
 /// by `frozen_sidecar_path` below, which has no such dependency.
 fn stt_venv_python() -> Option<std::path::PathBuf> {
     let candidate = stt_package_dir()
+        .join("streaming_asr_sidecar")
         .join(".venv")
         .join("Scripts")
         .join("python.exe");
@@ -122,15 +70,11 @@ fn stt_venv_python() -> Option<std::path::PathBuf> {
 /// resource simply isn't there.
 ///
 /// `tauri dev` has no bundled-resource directory at all (Tauri's resource
-/// resolver only exists for a built app), so this used to unconditionally
-/// fall back to the venv path below in dev — meaning every dev-mode STT
-/// start paid for a cold Python interpreter + sherpa-onnx import + model load
-/// from disk (several seconds), even on a machine that had already run
-/// `freeze_sidecar.py` and had the exact same frozen exe sitting right there
-/// unused. This now also checks that repo-relative dev build output
-/// directly, so `tauri dev` gets the same fast startup as a release build
-/// whenever the frozen sidecar has been built at least once — falling back
-/// to the venv path only if it genuinely hasn't.
+/// resolver only exists for a built app), so this also checks the
+/// repo-relative dev build output directly, so `tauri dev` gets the same
+/// fast startup as a release build whenever the frozen sidecar has been
+/// built at least once — falling back to the venv path only if it genuinely
+/// hasn't.
 fn frozen_sidecar_path(app: Option<&AppHandle>) -> Option<std::path::PathBuf> {
     if let Some(app) = app {
         if let Ok(candidate) = app.path().resolve("stt-sidecar/stt-sidecar.exe", BaseDirectory::Resource) {
@@ -157,21 +101,35 @@ fn resource_model_dir(app: Option<&AppHandle>) -> Option<std::path::PathBuf> {
     candidate.is_dir().then_some(candidate)
 }
 
-/// A running PocketSphinx sidecar process for one audio source (system audio or
-/// microphone). Owns the child process and the threads that pump audio in / read
-/// transcript events out.
+/// A running local VAD/endpointing engine process for one audio source
+/// (system audio or microphone), paired with Groq Cloud transcription.
+/// Owns the child process and the threads that pump audio in / read
+/// detected-utterance events out.
 pub struct SttSidecar {
     child: Child,
     stdin: Option<ChildStdin>,
     reader_thread: Option<JoinHandle<()>>,
+    /// The current utterance's raw samples, appended to by `send_samples`
+    /// and drained by the reader thread on each detected utterance boundary
+    /// to send to Groq. This is the "send only VAD-detected speech
+    /// segments" cut point: the local engine's own endpoint detection,
+    /// running on this same audio, decides where the buffer gets cut, not a
+    /// fixed duration or every chunk individually.
+    groq_utterance_buffer: Arc<Mutex<Vec<f32>>>,
 }
 
 impl SttSidecar {
-    /// Spawns the sidecar process. `events_tx` receives every partial/final/error
-    /// event the sidecar produces, forwarded from a dedicated reader thread so that
-    /// writing audio to stdin never blocks on draining stdout (a naive
-    /// write-then-read pattern deadlocks on Windows once the pipe buffer fills —
-    /// see docs/progress.md Step 4 for how this was diagnosed).
+    /// Spawns the local sherpa-onnx process that does voice-activity and
+    /// utterance-endpoint detection, and wires its detected utterances to
+    /// Groq Cloud's Whisper API for transcription (see `groq.rs`). The local
+    /// engine's own transcribed text is never used — it exists here purely
+    /// to decide *when* an utterance is complete; Groq is the only source of
+    /// transcript text.
+    ///
+    /// `events_tx` receives every partial/final event, forwarded from a
+    /// dedicated reader thread so that writing audio to stdin never blocks
+    /// on draining stdout (a naive write-then-read pattern deadlocks on
+    /// Windows once the pipe buffer fills).
     ///
     /// `num_threads`: an explicit thread count (from
     /// `hardware::PerformanceManager::effective_config()`) takes priority
@@ -184,23 +142,15 @@ impl SttSidecar {
     /// value explicitly here, rather than mutating `std::env` before each
     /// spawn, avoids a process-global race between them.
     ///
-    /// Blocks (up to `ready_timeout()`) until the sidecar signals
+    /// Blocks (up to `ready_timeout()`) until the local engine signals
     /// `{"type":"ready"}`, reports `{"type":"error",...}`, or exits without
-    /// either. Earlier versions of this function returned `Ok` the instant
-    /// the child process was spawned — before the model had loaded, and
-    /// sometimes before Python had even finished importing its
-    /// dependencies. On constrained hardware (slow CPU, competing for RAM
-    /// with the RAG service's own startup) that load can be slow or can
-    /// fail outright (e.g. an allocation failure), and neither was ever
-    /// visible to the caller: the command would report success and the UI
-    /// would show "Recording" with a sidecar that was still loading, or had
-    /// already crashed, and would never produce a single transcript event.
-    /// See `docs/performance-tuning.md`'s STT-start-reliability section.
+    /// either — so the caller never reports "recording started" while the
+    /// engine is still loading or has already crashed.
     ///
     /// `app`: threaded through so a release build can find and run the
     /// PyInstaller-frozen sidecar bundled as a resource (see
-    /// `frozen_sidecar_path`) instead of requiring `packages/stt/.venv` —
-    /// which only ever exists on a dev machine, never on an end user's PC —
+    /// `frozen_sidecar_path`) instead of requiring `streaming_asr_sidecar/.venv`
+    /// — which only ever exists on a dev machine, never on an end user's PC —
     /// to be present. `None` for the headless `bin/pipeline_test*.rs`
     /// binaries, which have no `AppHandle` and always exercise the
     /// dev-tree venv/script path below instead.
@@ -210,71 +160,69 @@ impl SttSidecar {
         num_threads: Option<u32>,
         app: Option<&AppHandle>,
     ) -> Result<Self, String> {
-        let engine = SttEngineKind::from_env();
-
         let source_arg = match source {
             AudioSource::SystemAudio => "SYSTEM_AUDIO",
             AudioSource::Microphone => "MICROPHONE",
         };
 
-        // Three ways to end up with something runnable, tried in order: the
-        // frozen, fully self-contained sidecar bundled into a release build
-        // (no Python needed on the target machine at all); the dev-tree
-        // venv interpreter running the source script directly; or, for the
-        // PocketSphinx comparison engine only (never frozen — it's not the
-        // production engine), whatever system Python is on PATH.
+        // Two ways to end up with something runnable, tried in order: the
+        // dev-tree venv interpreter running the source script directly (the
+        // primary path whenever a dev venv is present), or the frozen,
+        // fully self-contained sidecar bundled into a release build (no
+        // Python needed on the target machine at all) as a fallback for
+        // machines with no such venv.
         let mut used_frozen_sidecar_without_bundle = false;
-        let (executable, args) = if let (SttEngineKind::StreamingAsr, Some(frozen)) =
-            (engine, frozen_sidecar_path(app))
-        {
-            // `resource_model_dir(app)` below tells us whether this frozen
-            // exe actually came from a real Tauri resource bundle (release
-            // build) or from `frozen_sidecar_path`'s dev-mode fallback onto
-            // `packages/stt/dist/` directly — only the latter needs
-            // `STT_MODEL_DIR` set explicitly, since the frozen exe's own
-            // relative-default model resolution doesn't work outside a
-            // PyInstaller bundle's real install location.
-            used_frozen_sidecar_without_bundle = resource_model_dir(app).is_none();
-            (frozen.to_string_lossy().to_string(), vec![source_arg.to_string()])
-        } else {
-            let (python, mut base_args) = match (engine, stt_venv_python()) {
-                (SttEngineKind::StreamingAsr, Some(venv)) => {
-                    (venv.to_string_lossy().to_string(), Vec::new())
-                }
-                (SttEngineKind::StreamingAsr, None) => {
-                    return Err(
-                        "STT venv not found at packages/stt/.venv — run: \
-                         py -3 -m venv packages/stt/.venv && \
-                         packages/stt/.venv/Scripts/python.exe -m pip install sherpa-onnx numpy"
-                            .to_string(),
-                    )
-                }
-                (SttEngineKind::PocketSphinx, _) => find_python().ok_or_else(|| {
-                    "no Python 3 interpreter found (tried `py -3` and `python`)".to_string()
-                })?,
-            };
-
-            let script = engine.script_path();
+        let (executable, args) = if let Some(venv) = stt_venv_python() {
+            let script = script_path();
             if !script.exists() {
                 return Err(format!("STT sidecar script not found at {}", script.display()));
             }
-
-            base_args.push(script.to_string_lossy().to_string());
-            base_args.push(source_arg.to_string());
-            (python, base_args)
+            (
+                venv.to_string_lossy().to_string(),
+                vec![script.to_string_lossy().to_string(), source_arg.to_string()],
+            )
+        } else if let Some(frozen) = frozen_sidecar_path(app) {
+            // `resource_model_dir(app)` below tells us whether this frozen
+            // exe actually came from a real Tauri resource bundle (release
+            // build) or from `frozen_sidecar_path`'s dev-mode fallback
+            // directly — only the latter needs `STT_MODEL_DIR` set
+            // explicitly, since the frozen exe's own relative-default model
+            // resolution doesn't work outside a PyInstaller bundle's real
+            // install location.
+            used_frozen_sidecar_without_bundle = resource_model_dir(app).is_none();
+            (frozen.to_string_lossy().to_string(), vec![source_arg.to_string()])
+        } else {
+            return Err(
+                "STT venv not found at streaming_asr_sidecar/.venv — run: \
+                 py -3 -m venv streaming_asr_sidecar/.venv && \
+                 streaming_asr_sidecar/.venv/Scripts/python.exe -m pip install sherpa-onnx numpy"
+                    .to_string(),
+            );
         };
 
-        // Trailing silence before the current utterance is finalized. Settable
-        // via the launch environment so it can be tuned without a rebuild. The
-        // two engines want different defaults, so each sidecar picks its own
-        // when this is unset rather than having one value imposed here.
+        // Trailing silence before the current utterance is finalized —
+        // this IS the endpoint-detection tuning, independent of who
+        // transcribes the resulting audio. Settable via the launch
+        // environment so it can be tuned without a rebuild.
         let end_silence_ms = std::env::var("STT_END_SILENCE_MS").ok();
+
+        // The local engine's own VAD pre-gate was silently discarding a
+        // large share of real microphone chunks as "non-speech" before they
+        // ever reached the endpoint detector (observed 48-64% of chunks
+        // skipped on live mic input vs. ~3-6% on clean pre-recorded test
+        // audio) — the direct cause of utterances finalizing on garbled/
+        // incomplete audio. Defaulting it off here trades a little extra
+        // CPU for not dropping real speech; still overridable via
+        // STT_VAD_GATE_ENABLED for anyone who wants the gate back (e.g. a
+        // genuinely noisy room).
+        let vad_gate_enabled = std::env::var("STT_VAD_GATE_ENABLED").unwrap_or_else(|_| "false".to_string());
 
         let mut command = hidden_command(&executable);
         command.args(&args);
         if let Some(ms) = end_silence_ms {
             command.env("STT_END_SILENCE_MS", ms);
         }
+        command.env("STT_VAD_GATE_ENABLED", vad_gate_enabled);
         match num_threads {
             Some(threads) => {
                 command.env("STT_NUM_THREADS", threads.to_string());
@@ -293,25 +241,23 @@ impl SttSidecar {
         // The frozen exe's own default model path (sidecar.py's
         // `_resolve_model_dir`) is resolved relative to `__file__`, which
         // under PyInstaller points into the frozen bundle's temp extraction
-        // directory, not this repo — so when `tauri dev`'s dev-mode fallback
-        // above picked the frozen exe from `packages/stt/dist/` (no
-        // Tauri resource bundle to resolve `resource_model_dir` from), it
-        // still needs `STT_MODEL_DIR` pointed at the repo's `models/stt/`
-        // directory explicitly, exactly as a real release build's resource
-        // bundle would.
+        // directory, not this repo — so when the dev-mode fallback above
+        // picked the frozen exe with no Tauri resource bundle to resolve
+        // `resource_model_dir` from, it still needs `STT_MODEL_DIR` pointed
+        // at the repo's `models/stt/` directory explicitly, exactly as a
+        // real release build's resource bundle would.
         if let Some(dir) = resource_model_dir(app) {
             command.env("STT_MODEL_DIR", dir);
         } else if let Ok(dir) = std::env::var("STT_MODEL_DIR") {
             command.env("STT_MODEL_DIR", dir);
         } else if used_frozen_sidecar_without_bundle {
-            let dev_model_dir = stt_package_dir()
-                .join("models")
-                .join("stt")
-                .join("nemo-fastconformer-80ms-int8");
+            let dev_model_dir = stt_package_dir().join("models").join("stt").join("nemo-fastconformer-80ms-int8");
             if dev_model_dir.is_dir() {
                 command.env("STT_MODEL_DIR", dev_model_dir);
             }
         }
+
+        let groq_utterance_buffer = Arc::new(Mutex::new(Vec::new()));
 
         let mut child = command
             .stdin(Stdio::piped())
@@ -341,6 +287,15 @@ impl SttSidecar {
 
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
+        // Cloned (not moved-by-reference) so it can live in the reader
+        // thread's `'static` closure below — `app` itself is only a borrow
+        // for the duration of this `spawn()` call, needed above purely for
+        // path resolution. `AppHandle::clone()` is cheap (an Arc internally).
+        // `None` for the headless test binaries (see this fn's doc), so
+        // those keep emitting nothing, exactly as before this change.
+        let app_for_errors = app.cloned();
+
+        let reader_buffer = groq_utterance_buffer.clone();
         let reader_thread = std::thread::Builder::new()
             .name("stt-sidecar-reader".into())
             .spawn(move || {
@@ -357,33 +312,84 @@ impl SttSidecar {
                     }
                     match serde_json::from_str::<SidecarLine>(&line) {
                         Ok(SidecarLine::Ready) => {
-                            log::info!("STT sidecar ready ({source_arg})");
+                            log::info!("STT VAD engine ready ({source_arg}); transcription via Groq Cloud (whisper-large-v3-turbo)");
                             if !ready_signaled {
                                 ready_signaled = true;
                                 let _ = ready_tx.send(Ok(()));
                             }
                         }
-                        Ok(SidecarLine::Partial { text, source }) => {
-                            let _ = events_tx.send(SttEvent {
-                                kind: SttEventKind::Partial,
-                                text,
-                                source,
-                                start_time: None,
-                                end_time: None,
-                            });
+                        Ok(SidecarLine::Partial { text: _, source: _ }) => {
+                            // The local engine's own partial text is not
+                            // forwarded: Groq has no meaningful concept of a
+                            // "partial" for an utterance still in progress
+                            // (it only ever transcribes a complete buffered
+                            // segment on `Final`), and forwarding text that
+                            // will never match what the user eventually sees
+                            // would be misleading rather than merely absent.
                         }
                         Ok(SidecarLine::Final {
-                            text,
+                            text: _local_text,
                             source,
                             start_time,
                             end_time,
                         }) => {
-                            let _ = events_tx.send(SttEvent {
-                                kind: SttEventKind::Final,
-                                text,
-                                source,
-                                start_time: Some(start_time),
-                                end_time: Some(end_time),
+                            // The local engine has decided this utterance is
+                            // complete — that decision (VAD/endpointing) is
+                            // the only thing it's kept running for. Take the
+                            // buffered raw audio for this utterance and ask
+                            // Groq on a SEPARATE thread, not inline here:
+                            // this loop is the only thing draining the local
+                            // engine's stdout, which keeps emitting partials
+                            // for whatever the user says next while a Groq
+                            // request is in flight. Blocking this loop on
+                            // that request (Groq's own timeout is up to
+                            // 15s+) stalls stdout drainage; once the local
+                            // engine's stdout pipe buffer fills from
+                            // undrained partial-JSON lines, its writes block
+                            // and the whole child process — including its
+                            // stdin — stops responding, which was observed
+                            // to kill the sidecar outright, not just delay
+                            // one utterance's transcript. Groq is the only
+                            // source of transcript text, so an error becomes
+                            // an empty final rather than a silently-wrong
+                            // local transcript; per-utterance Groq calls have
+                            // no ordering requirement between each other, so
+                            // spawning a new thread per utterance (mic
+                            // utterances are seconds apart, never a tight
+                            // loop) is simpler than a bounded worker pool.
+                            let samples = reader_buffer.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
+                            let events_tx = events_tx.clone();
+                            let app_for_groq_error = app_for_errors.clone();
+                            std::thread::spawn(move || {
+                                let text = match groq::transcribe(&samples, TARGET_SAMPLE_RATE) {
+                                    Ok(groq_text) => groq_text,
+                                    Err(err) => {
+                                        log::error!("Groq transcription failed for this utterance: {err}");
+                                        // Real error signal for the orb
+                                        // widgets — this failure previously
+                                        // had no path to the frontend at all
+                                        // (not even via invoke().catch(),
+                                        // since it happens on a background
+                                        // thread with no command in flight):
+                                        // the utterance was just silently
+                                        // dropped as an empty final below.
+                                        if let Some(app) = app_for_groq_error.as_ref() {
+                                            use tauri::Emitter;
+                                            let _ = app.emit("veronica:error", format!("Speech transcription failed: {err}"));
+                                        }
+                                        String::new()
+                                    }
+                                };
+                                if text.is_empty() {
+                                    return;
+                                }
+                                let _ = events_tx.send(SttEvent {
+                                    kind: SttEventKind::Final,
+                                    text,
+                                    source,
+                                    start_time: Some(start_time),
+                                    end_time: Some(end_time),
+                                });
                             });
                         }
                         Ok(SidecarLine::Error { message }) => {
@@ -391,6 +397,15 @@ impl SttSidecar {
                             if !ready_signaled {
                                 ready_signaled = true;
                                 let _ = ready_tx.send(Err(message));
+                            } else if let Some(app) = app_for_errors.as_ref() {
+                                // Post-startup error: a pre-ready one is
+                                // already surfaced via spawn()'s own Err
+                                // return above, so only emit here for
+                                // failures happening after the session was
+                                // already reported healthy — those had no
+                                // path to the frontend before this.
+                                use tauri::Emitter;
+                                let _ = app.emit("veronica:error", format!("Speech recognition error: {message}"));
                             }
                         }
                         Err(err) => {
@@ -429,12 +444,22 @@ impl SttSidecar {
             child,
             stdin,
             reader_thread: Some(reader_thread),
+            groq_utterance_buffer,
         })
     }
 
     /// Encodes f32 samples (range -1.0..1.0) as PCM16 and writes them to the
-    /// sidecar's stdin using the length-prefixed frame protocol.
+    /// local engine's stdin using the length-prefixed frame protocol, so it
+    /// can keep detecting utterance boundaries. Also appends the raw samples
+    /// to the current utterance's buffer (drained by the reader thread on
+    /// each detected boundary and sent to Groq) — this is the "send only
+    /// VAD-detected speech segments" cut point: the local engine's endpoint
+    /// detection, running on this same audio, decides where that buffer
+    /// gets cut and sent, not a fixed duration or every chunk individually.
     pub fn send_samples(&mut self, samples: &[f32]) -> Result<(), String> {
+        if let Ok(mut buf) = self.groq_utterance_buffer.lock() {
+            buf.extend_from_slice(samples);
+        }
         let Some(stdin) = self.stdin.as_mut() else {
             return Err("sidecar stdin already closed".into());
         };
@@ -447,8 +472,10 @@ impl SttSidecar {
         write_frame(stdin, &bytes)
     }
 
-    /// Sends the zero-length flush marker so the sidecar finalizes any in-progress
-    /// utterance immediately (used when the user pauses/stops recording).
+    /// Sends the zero-length flush marker so the local engine finalizes any
+    /// in-progress utterance immediately (used when the user pauses/stops
+    /// recording) — that finalization is what triggers sending the buffered
+    /// audio to Groq for this last utterance.
     pub fn flush(&mut self) -> Result<(), String> {
         let Some(stdin) = self.stdin.as_mut() else {
             return Err("sidecar stdin already closed".into());

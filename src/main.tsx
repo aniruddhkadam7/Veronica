@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import App from "./App";
 import { VeronicaOverlay } from "./VeronicaOverlay";
+import { VeronicaWidget } from "./VeronicaWidget";
 import "./tailwind.css";
 import "./overlay.css";
 
@@ -10,7 +11,7 @@ import "./overlay.css";
 // window (Tauri's WebviewUrl::App points both at "index.html") — which root
 // component renders is decided here by the window's label, set when the
 // overlay is created in Rust.
-const FIXED_OVERLAY_LABELS = new Set(["veronica-overlay"]);
+const FIXED_OVERLAY_LABELS = new Set(["veronica-overlay", "veronica-widget"]);
 
 const label = getCurrentWebviewWindow().label;
 const isOverlay = FIXED_OVERLAY_LABELS.has(label);
@@ -24,9 +25,16 @@ if (isOverlay) {
   // `:has()` support in whatever WebView2 version is installed.
   document.documentElement.classList.add("overlay-window");
 }
+if (label === "veronica-widget") {
+  // Separate class from "overlay-window" so overlay.css's widget-only rules
+  // (see .veronica-widget-root) don't leak into the full chat overlay.
+  document.body.classList.add("veronica-widget-window");
+  document.documentElement.classList.add("veronica-widget-window");
+}
 
 function Root() {
   if (label === "veronica-overlay") return <VeronicaOverlay />;
+  if (label === "veronica-widget") return <VeronicaWidget />;
   return <App />;
 }
 

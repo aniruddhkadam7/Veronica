@@ -3,8 +3,11 @@
 //! ├── MicrophoneCapture   (WASAPI capture of a default/selected input device)
 //! └── AudioDeviceManager  (device enumeration)
 //!
-//! Captured audio never leaves this process as raw audio — see `stt` for the local
-//! PocketSphinx pipeline that consumes it and produces text only.
+//! Captured audio is consumed by `stt`: a local sherpa-onnx engine detects
+//! speech/utterance boundaries, and each detected segment's raw audio is
+//! sent to Groq Cloud's Whisper API for transcription — the only point in
+//! this app where captured audio leaves the machine, and only that
+//! already-endpointed segment, never a continuous stream.
 
 mod device_manager;
 mod gap_fill;

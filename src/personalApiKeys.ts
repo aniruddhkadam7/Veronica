@@ -7,14 +7,21 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type PersonalLlmProvider = "openai" | "anthropic" | "gemini";
 
-export function getPersonalApiKey(provider: PersonalLlmProvider): Promise<string | null> {
+// Not LLM providers — Groq (speech-to-text) and Deepgram (text-to-speech) —
+// but they use this exact same Tauri command set / Credential Manager store
+// (see src-tauri/src/personal/api_key_store.rs, which is keyed by a plain
+// provider-name string, not restricted to PersonalLlmProvider) since a
+// second storage mechanism for two more secrets would be pure duplication.
+export type PersonalServiceProvider = "groq" | "deepgram";
+
+export function getPersonalApiKey(provider: PersonalLlmProvider | PersonalServiceProvider): Promise<string | null> {
   return invoke<string | null>("personal_get_api_key", { provider });
 }
 
-export function setPersonalApiKey(provider: PersonalLlmProvider, key: string): Promise<void> {
+export function setPersonalApiKey(provider: PersonalLlmProvider | PersonalServiceProvider, key: string): Promise<void> {
   return invoke<void>("personal_set_api_key", { provider, key });
 }
 
-export function clearPersonalApiKey(provider: PersonalLlmProvider): Promise<void> {
+export function clearPersonalApiKey(provider: PersonalLlmProvider | PersonalServiceProvider): Promise<void> {
   return invoke<void>("personal_clear_api_key", { provider });
 }

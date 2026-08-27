@@ -15,7 +15,6 @@ pub mod pressure;
 pub mod profile;
 pub mod storage;
 pub mod store;
-pub mod stt_mode;
 pub mod stt_rag_coordination;
 pub mod telemetry;
 pub mod tier;

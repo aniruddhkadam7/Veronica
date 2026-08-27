@@ -105,7 +105,7 @@ fn main() {
 
     let pause_for_pipeline = pause.clone();
     let pipeline_thread = std::thread::spawn(move || {
-        run_stt_pipeline(audio_rx, sidecar, pause_for_pipeline, |_chunk| {});
+        run_stt_pipeline(audio_rx, sidecar, pause_for_pipeline, None, |_chunk| {});
     });
 
     if lifecycle {

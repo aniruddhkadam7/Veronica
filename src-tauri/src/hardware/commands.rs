@@ -6,7 +6,6 @@ use crate::state::AppState;
 use super::manager::{PerformanceConfig, PerformanceMode};
 use super::profile::HardwareProfile;
 use super::store;
-use super::stt_mode::{self, ResolvedSttMode, SttModePreference};
 use super::tier::HardwareTier;
 use super::PerformanceState;
 
@@ -33,32 +32,6 @@ pub struct PerformanceModeInfo {
 pub fn get_hardware_profile(state: State<'_, PerformanceState>) -> Result<HardwareProfile, String> {
     let manager = state.0.lock().map_err(|e| e.to_string())?;
     Ok(manager.profile().clone())
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SttModeInfo {
-    pub preference: SttModePreference,
-    pub resolved: ResolvedSttMode,
-    /// Purely informational — never a gate. See `stt_mode::local_stt_recommended`.
-    pub local_stt_recommended: bool,
-}
-
-/// Read-only: reports what STT_MODE would resolve to on this machine right
-/// now. Does not change which STT engine actually runs — that's still
-/// `SttEngineKind::from_env` in `stt::sidecar`, unaffected by this command
-/// (see `hardware::stt_mode`'s module doc for why cloud STT stays
-/// unreachable regardless of this result).
-#[tauri::command]
-pub fn get_stt_mode_info(state: State<'_, PerformanceState>) -> Result<SttModeInfo, String> {
-    let manager = state.0.lock().map_err(|e| e.to_string())?;
-    let tier = manager.detected_tier();
-    let preference = stt_mode::preference_from_env();
-    Ok(SttModeInfo {
-        preference,
-        resolved: stt_mode::resolve(preference, tier),
-        local_stt_recommended: stt_mode::local_stt_recommended(tier),
-    })
 }
 
 #[tauri::command]

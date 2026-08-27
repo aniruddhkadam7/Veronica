@@ -20,7 +20,9 @@ import {
   joinSpeech,
 } from "./questionCompleteness";
 import { AudioLevelBars, useSttSpeaking } from "./ui";
+import { ParticlesOrb } from "@/registry/orbe/particles-orb/particles-orb";
 import { loadLlmProvider } from "./llmProviderSetting";
+import { useVeronicaOrbState } from "./useVeronicaOrbState";
 
 interface OverlayCaptureStatus {
   excluded: boolean;
@@ -52,6 +54,13 @@ const MAX_QUESTION_INPUT_PX = 160;
 const OPACITY_MIN = 0.15;
 const OPACITY_MAX = 1;
 
+/// How long the "just summoned via hotkey" wake-up glow stays elevated
+/// (brighter/faster orb pulse, see `justWokeUp`) after `veronica:auto-opened`
+/// fires, before falling back to whatever `veronicaState` would show anyway.
+/// Long enough to read as a deliberate greeting beat, short enough not to
+/// linger once the user has clearly moved on to typing/talking.
+const WAKE_UP_GLOW_MS = 2500;
+
 // Auto AI silence-window constants, the completeness classifier, and
 // joinSpeech() now live in questionCompleteness.ts, shared with Custom
 // Agents' overlay so both Auto AI implementations behave identically.
@@ -81,12 +90,6 @@ export function VeronicaOverlay() {
   // has no separate on/off state here.
   const [systemAudioActive, setSystemAudioActive] = useState(false);
   const systemAudioActiveRef = useRef(false);
-  // True from the moment a question is sent (askAI) until its
-  // answer starts streaming back — the "Thinking" segment of Veronica's
-  // Idle -> Listening -> Thinking -> Speaking cycle. `busy` alone can't
-  // distinguish this from "Speaking" (the delta/complete phase), so this
-  // flips off on the first answer-delta or on answer-complete/failure.
-  const [veronicaThinking, setVeronicaThinking] = useState(false);
   // True only while STT is actively producing transcript output right now —
   // gates the listening animation so it doesn't run through silence just
   // because capture is technically still open.
@@ -96,6 +99,12 @@ export function VeronicaOverlay() {
   // Shows the opacity percentage in the header for a moment after adjusting.
   const [opacityHint, setOpacityHint] = useState(false);
   const [settings, setSettings] = useState<OverlaySettings>(() => loadOverlaySettings());
+  // True for a brief window right after Veronica is summoned via the global
+  // hotkey/tray from a fully-closed state — drives the orb's elevated
+  // "waking up" glow independent of veronicaState (which would otherwise
+  // just say "idle" the instant the greeting line finishes speaking).
+  const [justWokeUp, setJustWokeUp] = useState(false);
+  const wakeUpTimerRef = useRef<number | null>(null);
 
   const questionRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -197,7 +206,6 @@ export function VeronicaOverlay() {
     // Deltas always belong to the last turn — it is the only one that can be
     // pending, because Ask AI is disabled until the previous answer completes.
     const unlistenDelta = listen<string>("veronica:answer-delta", (event) => {
-      setVeronicaThinking(false);
       setTurns((prev) => {
         if (!prev.length) return prev;
         const last = prev[prev.length - 1];
@@ -207,7 +215,6 @@ export function VeronicaOverlay() {
     });
 
     const unlistenComplete = listen<string>("veronica:answer-complete", (event) => {
-      setVeronicaThinking(false);
       setTurns((prev) => {
         if (!prev.length) return prev;
         const last = prev[prev.length - 1];
@@ -228,6 +235,30 @@ export function VeronicaOverlay() {
       unlistenDelta.then((f) => f());
       unlistenComplete.then((f) => f());
       clearAutoAiTimer();
+    };
+  }, []);
+
+  // Fired by the Rust side (veronica_window::wake_veronica) only when the
+  // global hotkey/tray brought Veronica back from a fully-closed-to-tray
+  // state — i.e. what the user experiences as "the app was closed and I hit
+  // the shortcut". A plain toggle-open while already in use never fires
+  // this, so the greeting doesn't repeat on every open/close.
+  useEffect(() => {
+    const unlisten = listen("veronica:auto-opened", () => {
+      setJustWokeUp(true);
+      invoke<string>("speak_greeting").catch(() => {
+        // Best-effort — TTS may be unavailable (no API key/network); the
+        // orb's own wake-up glow still carries the moment silently.
+      });
+      if (wakeUpTimerRef.current) window.clearTimeout(wakeUpTimerRef.current);
+      wakeUpTimerRef.current = window.setTimeout(() => {
+        wakeUpTimerRef.current = null;
+        setJustWokeUp(false);
+      }, WAKE_UP_GLOW_MS);
+    });
+    return () => {
+      unlisten.then((f) => f());
+      if (wakeUpTimerRef.current) window.clearTimeout(wakeUpTimerRef.current);
     };
   }, []);
 
@@ -278,7 +309,6 @@ export function VeronicaOverlay() {
       setError(null);
       setConfirmingClose(false);
       setSettingsOpen(false);
-      setVeronicaThinking(false);
       committedRef.current = "";
       busyRef.current = false;
       sessionStartedAtRef.current = Date.now();
@@ -313,7 +343,6 @@ export function VeronicaOverlay() {
     committedRef.current = "";
     busyRef.current = true;
     setBusy(true);
-    setVeronicaThinking(true);
 
     // Prior turns only — the one just pushed is the current question, and
     // completed turns are the only ones worth replaying.
@@ -342,6 +371,7 @@ export function VeronicaOverlay() {
           responseStyle: settings.responseStyle,
           humanization: settings.humanization,
           llmProvider,
+          ttsEnabled: settings.voiceOutputEnabled,
         },
       });
     } catch (e) {
@@ -353,7 +383,6 @@ export function VeronicaOverlay() {
       );
       busyRef.current = false;
       setBusy(false);
-      setVeronicaThinking(false);
     }
   }, [question, turns, settings]);
 
@@ -377,7 +406,6 @@ export function VeronicaOverlay() {
     setError(null);
     busyRef.current = false;
     setBusy(false);
-    setVeronicaThinking(false);
 
     // The overlay window is reused (not destroyed) between sessions, so a
     // capture session left running would otherwise keep transcribing into
@@ -531,23 +559,29 @@ export function VeronicaOverlay() {
   const hasConversation = turns.length > 0;
   const opacityPercent = Math.round(settings.opacity * 100);
 
-  // Veronica's Idle -> Listening -> Thinking -> Speaking cycle, derived from
-  // state that already exists rather than tracked separately (so it can
-  // never drift out of sync with what's actually happening):
-  //   - Thinking: a question has been sent and no answer text has arrived
-  //     yet (veronicaThinking, cleared on the first delta).
-  //   - Speaking: the answer is actively streaming in (busy, past Thinking).
-  //   - Listening: not currently busy, and STT is hearing speech right now
-  //     (sttSpeaking) — silence while listening is still technically on
-  //     reads as Idle.
-  //   - Idle: silent and not busy.
-  const veronicaState: "idle" | "listening" | "thinking" | "speaking" = veronicaThinking
-    ? "thinking"
-    : busy
-      ? "speaking"
-      : sttSpeaking
-        ? "listening"
-        : "idle";
+  // Real pipeline-driven orb state (thinking/executing/speaking/error/
+  // listening), shared with VeronicaWidget.tsx via useVeronicaOrbState so
+  // both surfaces always agree — see that hook's doc for exactly which
+  // Rust-emitted event drives each state. `veronicaThinking`/`busy` above
+  // remain purely for this window's own turn/pending bookkeeping (deciding
+  // when a new question can be sent, which turn to append streamed text
+  // to) — orthogonal to what the orb visually shows.
+  const { orbState: pipelineOrbState, lastError: pipelineError } = useVeronicaOrbState();
+  // While the post-hotkey wake-up glow is active and nothing else is
+  // already happening, show the orb as "speaking" (its brightest, fastest
+  // state) — it's the moment Veronica's greeting line is actually playing,
+  // so the visual should read as alive, not idle. The greeting's TTS never
+  // fires "tts:speaking-changed" (that event is emitted by the mic-assistant
+  // pump's mute-gate check, not by speak_greeting directly), so without this
+  // override the orb would sit on idle throughout the whole greeting.
+  const orbState = justWokeUp && pipelineOrbState === "idle" ? "speaking" : pipelineOrbState;
+  // Kept as its own label-only condition (not derived from orbState, which
+  // is now "connecting" for an in-progress action, not "thinking") so the
+  // header text below still reads sensibly for both cases. useVeronicaOrbState
+  // never actually returns "disabled" (not in its own state machine), but
+  // TypeScript widens to OrbState's full union — handled defensively anyway.
+  const veronicaState: "idle" | "listening" | "thinking" | "speaking" =
+    orbState === "connecting" ? "thinking" : orbState === "thinking" || orbState === "speaking" || orbState === "listening" ? orbState : "idle";
 
   return (
     <div
@@ -563,6 +597,7 @@ export function VeronicaOverlay() {
         className="overlay-header"
         data-tauri-drag-region={settings.dragEnabled ? "deep" : undefined}
       >
+        <ParticlesOrb state={orbState} size={20} speed={1} colorFrom="#f0abfc" colorTo="#818cf8" />
         <AudioLevelBars active={sttSpeaking && !busy} />
         <div className="overlay-title">
           {/* While adjusting, the title doubles as the readout — the change
@@ -573,15 +608,19 @@ export function VeronicaOverlay() {
               (or may have failed — see the error banner below). */}
           {opacityHint
             ? `Opacity ${opacityPercent}%`
-            : veronicaState === "thinking"
-              ? "Veronica — Thinking…"
-              : veronicaState === "speaking"
-                ? "Veronica — Speaking…"
-                : veronicaState === "listening"
-                  ? "Veronica — Listening"
-                  : captureActive
-                    ? "Veronica — Idle"
-                    : "Starting…"}
+            : pipelineOrbState === "error"
+              ? "Veronica — Error"
+              : pipelineOrbState === "connecting"
+                ? "Veronica — Working…"
+                : veronicaState === "thinking"
+                  ? "Veronica — Thinking…"
+                  : veronicaState === "speaking"
+                    ? "Veronica — Speaking…"
+                    : veronicaState === "listening"
+                      ? "Veronica — Listening"
+                      : captureActive
+                        ? "Veronica — Idle"
+                        : "Starting…"}
         </div>
 
         <div className="overlay-header-actions">
@@ -720,6 +759,13 @@ export function VeronicaOverlay() {
           </div>
 
           {error && <p className="overlay-error">{error}</p>}
+          {/* Real background-thread pipeline failures (STT sidecar crash,
+              a Groq/Deepgram call failing for one utterance/sentence) that
+              have no invoke().catch() to surface through — see
+              useVeronicaOrbState's doc. Shown separately from `error` since
+              the two can be true at once (e.g. an in-flight ask_veronica
+              failing AND a background TTS sentence failing moments apart). */}
+          {pipelineError && <p className="overlay-error">{pipelineError}</p>}
         </>
       )}
     </div>

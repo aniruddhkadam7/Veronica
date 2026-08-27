@@ -111,6 +111,28 @@ body.overlay-window #root {
   50% { height: 14px; }
 }
 
+/* ---------- Veronica widget window: orb only, no chat UI ----------
+   Fills its whole (small, fixed, bottom-right-docked) window — see
+   veronica_widget.rs — so the entire visible area is one big click target
+   that expands into the full overlay. */
+html.veronica-widget-window,
+body.veronica-widget-window,
+body.veronica-widget-window #root {
+  background: transparent !important;
+  margin: 0;
+}
+
+.veronica-widget-root {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 .overlay-title {
   font-size: 11px;
   letter-spacing: 0.04em;

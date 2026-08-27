@@ -79,10 +79,58 @@ pub fn start_mic_assistant(
         })
         .map_err(|e| e.to_string())?;
 
+    let tts_speaking = app.state::<AppState>().tts_speaking.clone();
+    let app_for_level = app.clone();
     std::thread::Builder::new()
         .name("mic-assistant-pump".into())
         .spawn(move || {
+            // While Veronica's own TTS is speaking (checked live per chunk,
+            // not just at loop start — playback can start/stop mid-loop),
+            // the chunk is still drained from the channel (so the capture
+            // thread's send never blocks) but withheld from STT — otherwise
+            // her own voice, picked up acoustically by the mic, gets
+            // transcribed and answered as if the user said it. Mirrors
+            // audio::pipeline::run_stt_pipeline's PauseSignal handling.
+            let mut was_muted = false;
             for chunk in audio_rx.iter() {
+                // Emitted unconditionally (even while muted for TTS) so the
+                // orb widgets' "listening" animation reflects real mic input
+                // the same way commands.rs's system-audio path already does
+                // via run_stt_pipeline's on_level callback — this is the
+                // mic-assistant path's equivalent, previously missing
+                // entirely (chunk.rms_level was computed by MicrophoneCapture
+                // but never read here).
+                let _ = app_for_level.emit(
+                    "audio:level",
+                    crate::commands::AudioLevelEvent { source: chunk.source, rms_level: chunk.rms_level },
+                );
+                let is_speaking = tts_speaking.is_speaking();
+                if is_speaking {
+                    if !was_muted {
+                        // Entering mute: finalize whatever was already
+                        // heard so a half-decoded utterance doesn't sit in
+                        // the decoder and bleed into audio heard after
+                        // Veronica stops talking.
+                        if let Err(err) = sidecar.flush() {
+                            log::warn!("mic assistant: failed to flush STT sidecar before muting for TTS: {err}");
+                        }
+                        was_muted = true;
+                        // Real "Veronica is speaking" signal for the orb
+                        // widgets, piggybacked on this loop's existing
+                        // per-chunk read of `tts_speaking` (already polled at
+                        // mic-chunk cadence for the mute logic above) rather
+                        // than adding a new poller or threading an AppHandle
+                        // into tts::player (see that module's doc on why its
+                        // Sink/OutputStream must stay confined to one thread
+                        // with no Tauri coupling).
+                        let _ = app_for_level.emit("tts:speaking-changed", true);
+                    }
+                    continue;
+                }
+                if was_muted {
+                    was_muted = false;
+                    let _ = app_for_level.emit("tts:speaking-changed", false);
+                }
                 if let Err(err) = sidecar.send_samples(&chunk.samples) {
                     log::warn!("mic assistant: failed to send audio to STT sidecar: {err}");
                 }

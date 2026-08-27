@@ -45,7 +45,7 @@ impl DirectLlmClient {
     /// through their existing `Result<_, String>` return type.
     pub fn new(provider: Option<&str>) -> Result<Self, String> {
         let provider = provider.and_then(LlmProvider::from_wire_str).unwrap_or(LlmProvider::Anthropic);
-        let api_key = api_key_store::load_key(provider)?
+        let api_key = api_key_store::load_key(provider.as_wire_str())?
             .filter(|k| !k.is_empty())
             .ok_or_else(|| format!("No API key configured for {}. Add one in Settings.", provider.as_wire_str()))?;
         Ok(Self { provider, api_key })

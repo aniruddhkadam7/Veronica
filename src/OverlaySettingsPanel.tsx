@@ -120,6 +120,15 @@ export function OverlaySettingsPanel({ settings, onChange, onClose, captureExclu
           <input type="checkbox" checked={alwaysOnTop} onChange={toggleAlwaysOnTop} />
           <span>Always on top</span>
         </label>
+
+        <label className="overlay-settings-row overlay-settings-checkbox">
+          <input
+            type="checkbox"
+            checked={settings.voiceOutputEnabled}
+            onChange={(e) => set("voiceOutputEnabled", e.target.checked)}
+          />
+          <span>Speak answers aloud (Deepgram)</span>
+        </label>
       </div>
 
       <div className="overlay-settings-section">

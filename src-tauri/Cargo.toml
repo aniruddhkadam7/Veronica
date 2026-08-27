@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
@@ -67,4 +67,10 @@ tokio = { version = "1", features = ["time"] }
 # service's per-launch internal auth token (see src/rag/process.rs). Adds no
 # new crate to the dependency tree.
 ring = "0.17"
+# Deepgram TTS playback (src/tts/player.rs) — plays raw linear16 PCM chunks
+# on the default output device as they stream in from Deepgram, so speech
+# starts on the first chunk instead of waiting for the whole utterance to
+# synthesize. Pulls in `cpal` transitively for the actual device I/O,
+# mirroring how `wasapi` already handles capture-side device I/O in src/audio/.
+rodio = { version = "0.20", default-features = false }
 

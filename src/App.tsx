@@ -15,6 +15,7 @@ import { SettingsPopover } from "./SettingsPopover";
 import { LowEndHardwareBanner } from "./LowEndHardwareBanner";
 import { HeaderDropdown } from "./HeaderDropdown";
 import { Button, Spinner } from "./ui";
+import { ParticlesOrb } from "@/registry/orbe/particles-orb/particles-orb";
 import {
   IconAccount,
   IconAttachment,
@@ -30,7 +31,10 @@ import { VERONICA_CONTEXT_SECTIONS } from "./headerPopups";
 import { hasStoredLlmProvider, loadLlmProvider, saveLlmProvider, type LlmProvider } from "./llmProviderSetting";
 import { getPersonalApiKey } from "./personalApiKeys";
 
-type SessionState = "IDLE" | "STARTING" | "LISTENING";
+// "ACTIVE" replaces the old "LISTENING": Veronica is listening via the
+// floating widget, whether or not the full conversation overlay ("Open") is
+// currently shown on top of it — see the Start/Open/Stop rework below.
+type SessionState = "IDLE" | "STARTING" | "ACTIVE";
 type Popover = "MODEL" | "CONTEXT" | "SETTINGS" | "ACCOUNT" | null;
 
 // Only "openai", "anthropic", and "gemini" have a real backend
@@ -123,15 +127,18 @@ function App() {
   }, [isMaximized]);
 
   // The overlay window and this main window are separate webviews with no
-  // shared React state — ending a session from inside the overlay (its own
-  // ✕ / Escape) has no way to reset this window's Start/Stop button back to
-  // idle on its own. The Rust side emits this event whenever the overlay
-  // closes, from whichever side triggered it, so this listener is what
-  // keeps the two in sync instead of requiring a redundant click on Stop
-  // here after already ending it there.
+  // shared React state. Closing the overlay (its own ✕ / Escape) now only
+  // means "stop showing the conversation view" — Veronica keeps
+  // listening/working via the floating widget underneath, matching the
+  // "closing the overlay returns to the small floating widget; Veronica
+  // keeps working/listening normally" requirement — it must NOT end the
+  // session the way it used to when Stop and "close the overlay" were the
+  // same action. So this only toggles the overlay-visible flag, never
+  // sessionState.
+  const [overlayVisible, setOverlayVisible] = useState(false);
   useEffect(() => {
     const unlisten = listen("interview-mode:overlay-closed", () => {
-      setSessionState("IDLE");
+      setOverlayVisible(false);
     });
     return () => {
       unlisten.then((f) => f());
@@ -148,7 +155,12 @@ function App() {
 
   const closePopover = useCallback(() => setOpenPopover(null), []);
 
-  const handleStart = useCallback(async () => {
+  // Activates Veronica as an always-on floating widget (bottom-right orb,
+  // no conversation UI) — NOT the full overlay. This is what the orb
+  // toolbar button and "Start" both trigger; "Open" (below) is a separate,
+  // non-destructive action that only shows/hides the conversation view on
+  // top of this already-running session.
+  const handleActivate = useCallback(async () => {
     setError(null);
     setSessionState("STARTING");
     closePopover();
@@ -161,9 +173,9 @@ function App() {
       // backend) — local recording has no dependency on this feature and
       // must never be blocked by it. Only a genuine backend entitlement
       // rejection (no remaining minutes, concurrent session limit, etc.)
-      // sets `rejection`, which we propagate so Start actually stops — see
-      // start_backend_session's Rust-side doc (BackendSessionResult) for
-      // the full contract.
+      // sets `rejection`, which we propagate so activation actually stops —
+      // see start_backend_session's Rust-side doc (BackendSessionResult)
+      // for the full contract.
       const sessionResult = await invoke<{ rejection: string | null }>("start_backend_session", {
         sttMode: "local",
       });
@@ -180,38 +192,63 @@ function App() {
       await invoke("start_mic_assistant").catch((e) => {
         if (String(e) !== "mic assistant already running") throw e;
       });
-      await invoke("show_interview_overlay");
-      setSessionState("LISTENING");
+      await invoke("show_veronica_widget");
+      setSessionState("ACTIVE");
     } catch (e) {
       setError(String(e));
       setSessionState("IDLE");
     }
   }, [documentContext, closePopover]);
 
+  // Fully deactivates: stops the mic, hides both the widget and the overlay
+  // (if it happened to be open), and ends the backend session. This is the
+  // ONLY thing that ends the session — closing the overlay (see
+  // `interview-mode:overlay-closed` above) no longer does.
   const handleStop = useCallback(async () => {
+    invoke("hide_veronica_widget").catch(() => {});
+    if (overlayVisible) {
+      invoke("hide_interview_overlay").catch(() => {});
+    }
+    setOverlayVisible(false);
+    setSessionState("IDLE");
+    invoke("stop_mic_assistant").catch(() => {});
+    // Fire-and-forget: finalizes the backend session (if one was started)
+    // so its minutes get decremented. Never blocks Stop and never surfaces
+    // an error to the user — a network blip here must not cost the user
+    // the conversation they just finished. No-ops silently when the user
+    // isn't signed in (see start_backend_session).
+    invoke("end_backend_session").catch(() => {});
+  }, [overlayVisible]);
+
+  // "Open": reveals the full conversation overlay on top of the already-
+  // running widget session — never starts/restarts anything, since
+  // start_mic_assistant was already called by handleActivate and the
+  // overlay's own mount effect tolerates "already running" as success (see
+  // VeronicaOverlay.tsx). This is what makes "the conversation continues
+  // without interruption when opening/closing the overlay" true: nothing
+  // about the mic/STT session is touched by opening or closing the view.
+  const handleOpenOverlay = useCallback(async () => {
     try {
-      await invoke("hide_interview_overlay");
+      await invoke("show_interview_overlay");
+      setOverlayVisible(true);
     } catch (e) {
       setError(String(e));
-    } finally {
-      setSessionState("IDLE");
-      // Mic assistant is always-on for the whole session now (started by
-      // handleStart, no button in the overlay to stop it) — stop it here
-      // too, not just from the overlay's own close button, since Stop can
-      // end the session from this window without the overlay's closeOverlay
-      // ever running.
-      invoke("stop_mic_assistant").catch(() => {});
-      // Fire-and-forget: finalizes the backend session (if one was started)
-      // so its minutes get decremented. Never blocks Stop and never
-      // surfaces an error to the user — a network blip here must not cost
-      // the user the conversation they just finished. No-ops silently when
-      // the user isn't signed in (see start_backend_session).
-      invoke("end_backend_session").catch(() => {});
     }
   }, []);
 
-  const startLabel =
-    sessionState === "STARTING" ? "Starting…" : sessionState === "LISTENING" ? "Listening" : "Start";
+  const activateLabel =
+    sessionState === "STARTING" ? "Starting…" : sessionState === "ACTIVE" ? "Open" : "Start";
+
+  // Clicking the orb button itself toggles activation — matches "clicking
+  // the widget should place/activate it there"/"deactivate" from the spec,
+  // independent of the separate Open/Stop buttons that appear once active.
+  const handleOrbClick = useCallback(() => {
+    if (sessionState === "ACTIVE") {
+      handleStop();
+    } else if (sessionState === "IDLE") {
+      handleActivate();
+    }
+  }, [sessionState, handleStop, handleActivate]);
 
   const handleMinimize = useCallback(() => {
     getCurrentWindow().minimize();
@@ -334,27 +371,49 @@ function App() {
             )}
           </div>
 
-          {sessionState === "LISTENING" ? (
+          <button
+            type="button"
+            className={`compact-header-btn icon veronica-widget-launch-btn${sessionState === "ACTIVE" ? " active" : ""}`}
+            onClick={handleOrbClick}
+            disabled={sessionState === "STARTING"}
+            title={
+              sessionState === "ACTIVE"
+                ? "Deactivate Veronica"
+                : "Activate Veronica as a floating indicator (bottom-right, no chat window)"
+            }
+            aria-label={sessionState === "ACTIVE" ? "Deactivate Veronica" : "Activate Veronica"}
+            aria-pressed={sessionState === "ACTIVE"}
+          >
+            <ParticlesOrb state={sessionState === "ACTIVE" ? "listening" : "idle"} size={20} speed={1} colorFrom="#f0abfc" colorTo="#818cf8" />
+          </button>
+
+          {sessionState === "ACTIVE" && (
             <Button variant="danger" onClick={handleStop}>
               Stop
             </Button>
-          ) : (
-            <Button variant="primary" onClick={handleStart} disabled={sessionState === "STARTING"}>
-              {/* The STT model load behind Start can take a couple of
-                  seconds (cold-starting the sidecar process + loading the
-                  ONNX model) — a static label made that wait look frozen.
-                  This spinner is the only signal the user has that anything
-                  is happening until the overlay itself opens. */}
-              {sessionState === "STARTING" ? (
-                <span className="btn-spinner">
-                  <Spinner />
-                  {startLabel}
-                </span>
-              ) : (
-                startLabel
-              )}
-            </Button>
           )}
+
+          <Button
+            variant="primary"
+            onClick={sessionState === "ACTIVE" ? handleOpenOverlay : handleActivate}
+            disabled={sessionState === "STARTING"}
+          >
+            {/* The STT model load behind activation can take a couple of
+                seconds (cold-starting the sidecar process + loading the
+                ONNX model) — a static label made that wait look frozen.
+                This spinner is the only signal the user has that anything
+                is happening until the widget itself appears. Once active,
+                this button's only job is opening the conversation view —
+                it never restarts anything (see handleOpenOverlay). */}
+            {sessionState === "STARTING" ? (
+              <span className="btn-spinner">
+                <Spinner />
+                {activateLabel}
+              </span>
+            ) : (
+              activateLabel
+            )}
+          </Button>
 
           <div className="dropdown-anchor">
             <button

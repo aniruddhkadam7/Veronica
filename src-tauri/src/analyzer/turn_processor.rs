@@ -8,17 +8,16 @@
 //!    captures the meeting/call output — the other participant) is treated as a
 //!    candidate "question" if its text ends with `?`, OR starts with a common
 //!    interrogative/question-request word (see `looks_like_question`) — this
-//!    catches interviewer prompts that PocketSphinx-transcribed without a
-//!    trailing question mark, which is common since PocketSphinx does not
-//!    reliably produce punctuation.
+//!    catches interviewer prompts transcribed without a trailing question
+//!    mark, which any STT source can produce (punctuation is not guaranteed).
 //! 3. Everything from a `MICROPHONE` segment up to (but not including) the next
 //!    question-like `SYSTEM_AUDIO` segment is concatenated as that question's
 //!    answer.
 //! 4. Consecutive `SYSTEM_AUDIO` segments that don't individually look like a
 //!    question are merged into the *next* question-like segment's text, so a
-//!    question split across multiple STT finalization boundaries (a very
-//!    common PocketSphinx behavior — see docs/progress.md Step 4) is treated as
-//!    one question rather than several fragments.
+//!    question split across multiple STT finalization boundaries (utterance
+//!    endpointing can legitimately split one question into two segments) is
+//!    treated as one question rather than several fragments.
 //!
 //! This is intentionally conservative: it is fine for it to miss some
 //! implicit/unmarked questions (they simply won't be analyzed), but it should

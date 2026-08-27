@@ -18,13 +18,21 @@ mod process_util;
 mod rag;
 mod state;
 mod tls_init;
+mod tray;
 mod veronica;
+mod veronica_widget;
 mod veronica_window;
 mod voice_command;
 // Public alongside `audio` so `src/bin/pipeline_test.rs` can drive the real
 // recording pipeline headlessly instead of a reimplementation of it.
 pub mod stt;
 pub mod transcript;
+// Public alongside `audio`/`stt` so headless test binaries
+// (src/bin/pipeline_test*.rs) can construct a `tts::TtsSpeakingSignal` to
+// pass into `audio::run_stt_pipeline`'s signature, matching that function's
+// existing PauseSignal parameter — those binaries have no real TTS session,
+// only a `TtsSpeakingSignal::default()` that never becomes true.
+pub mod tts;
 mod windows_capture_protection;
 
 use tauri::Manager;
@@ -81,6 +89,19 @@ pub fn run() {
                         let _ = app.emit("veronica:toggle-shortcut", ());
                         return;
                     }
+                    if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::CONTROL
+                            | tauri_plugin_global_shortcut::Modifiers::SHIFT,
+                        tauri_plugin_global_shortcut::Code::Space,
+                    ) && tray::app_was_fully_hidden(app)
+                    {
+                        // The app was closed to tray (no window visible) —
+                        // this keypress is "open Veronica from nothing", so
+                        // she should also greet, not just silently appear.
+                        // See veronica_window::wake_veronica.
+                        veronica_window::wake_veronica(app);
+                        return;
+                    }
                     if let Err(err) = veronica_window::toggle_overlay_window_sync(app) {
                         log::warn!("failed to toggle Veronica overlay via hotkey: {err}");
                     }
@@ -107,6 +128,26 @@ pub fn run() {
 
             main_window::apply_light_titlebar(&app.handle().clone());
             main_window::position_top_center(&app.handle().clone());
+
+            if let Err(err) = tray::setup(&app.handle().clone()) {
+                log::warn!("failed to set up tray icon: {err}");
+            }
+
+            // Closing the main window (the titlebar X, or Alt+F4) hides it
+            // to the tray instead of quitting the whole app — the global
+            // hotkeys (and the ability to bring Veronica back at all) only
+            // work while the process keeps running, so "closing" the window
+            // must not kill the process. The tray menu's "Quit" is the only
+            // way to actually exit (see tray.rs).
+            if let Some(main_window) = app.get_webview_window(main_window::MAIN_WINDOW_LABEL) {
+                let window_to_hide = main_window.clone();
+                main_window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window_to_hide.hide();
+                    }
+                });
+            }
 
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
             // Ctrl+Shift+Space: show/hide the Interview Mode overlay (spec
@@ -178,7 +219,9 @@ pub fn run() {
             veronica_window::start_backend_session,
             veronica_window::end_backend_session,
             veronica::ask_veronica,
-            hardware::commands::get_stt_mode_info,
+            veronica::speak_greeting,
+            veronica_widget::show_veronica_widget,
+            veronica_widget::hide_veronica_widget,
             notes_mode::store::list_notes,
             notes_mode::store::get_note,
             notes_mode::store::create_note,

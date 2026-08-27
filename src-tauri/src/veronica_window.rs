@@ -4,7 +4,7 @@
 //! longer chosen to be neutral between two modes — it's just Veronica's
 //! window.
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::overlay_window;
 use crate::state::AppState;
@@ -14,7 +14,11 @@ pub use overlay_window::OverlayCaptureStatus;
 pub const OVERLAY_WINDOW_LABEL: &str = "veronica-overlay";
 const OVERLAY_TITLE: &str = "Veronica";
 
-fn show_overlay_window(app: &AppHandle) -> Result<OverlayCaptureStatus, String> {
+// `pub(crate)`, not private: `veronica_widget` also calls this directly (to
+// expand the widget into the full overlay), and reuses `run_on_main` below
+// to do so from its own `#[tauri::command]`s rather than duplicating the
+// main-thread dispatch dance.
+pub(crate) fn show_overlay_window(app: &AppHandle) -> Result<OverlayCaptureStatus, String> {
     overlay_window::show_overlay_window(app, OVERLAY_WINDOW_LABEL, OVERLAY_TITLE)
 }
 
@@ -32,6 +36,36 @@ pub fn toggle_overlay_window_sync(app: &AppHandle) -> Result<OverlayCaptureStatu
     toggle_overlay_window(app)
 }
 
+/// Brings Veronica to the front from a fully-closed-to-tray state — called
+/// from the global hotkey handler and the tray icon (click or "Show
+/// Veronica" menu item). Unlike a plain toggle, this only ever opens: it's
+/// what a user reaching for Veronica while every window is hidden expects,
+/// not a 50/50 toggle that might close something that isn't even visible.
+///
+/// If the app really was fully hidden beforehand (both windows closed —
+/// the "app is closed" case from the hotkey's perspective, even though the
+/// process kept running in the tray), emits `veronica:auto-opened` so the
+/// overlay knows to play its greeting animation/voice line, matching the
+/// "wake up and say something" behavior a hotkey-summoned assistant should
+/// have. A plain re-focus while the overlay was already open does not
+/// re-trigger the greeting.
+pub fn wake_veronica(app: &AppHandle) {
+    let was_fully_hidden = crate::tray::app_was_fully_hidden(app);
+    let app_for_main = app.clone();
+    let result = app.run_on_main_thread(move || {
+        if let Err(err) = show_overlay_window(&app_for_main) {
+            log::warn!("failed to show Veronica overlay from hotkey/tray: {err}");
+            return;
+        }
+        if was_fully_hidden {
+            let _ = app_for_main.emit("veronica:auto-opened", ());
+        }
+    });
+    if let Err(err) = result {
+        log::warn!("failed to schedule Veronica wake-up on main thread: {err}");
+    }
+}
+
 fn set_overlay_always_on_top_inner(app: &AppHandle, enabled: bool) -> Result<(), String> {
     overlay_window::set_overlay_always_on_top(app, OVERLAY_WINDOW_LABEL, enabled)
 }
@@ -47,7 +81,7 @@ fn resize_overlay_inner(app: &AppHandle, fraction: f64) -> Result<(), String> {
 // directly from here deadlocks. Route the actual window work through
 // `run_on_main_thread` and use a channel to bring the result back to the
 // (async) command so the IPC call still completes normally.
-async fn run_on_main<T, F>(app: &AppHandle, f: F) -> Result<T, String>
+pub(crate) async fn run_on_main<T, F>(app: &AppHandle, f: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,

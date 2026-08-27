@@ -25,6 +25,16 @@ src-tauri/gen
 models/
 sidecars/
 
+# streaming_asr_sidecar's local Python virtual environment — machine-
+# specific (interpreter path, compiled .pyd/.dll binaries for this exact
+# Python/OS/arch), 100MB+, and rebuildable from scratch on any machine (see
+# README.md for the venv setup command). Only streaming_asr_sidecar/sidecar.py
+# itself is real source.
+streaming_asr_sidecar/.venv/
+streaming_asr_sidecar/__pycache__/
+__pycache__/
+*.pyc
+
 # Secrets — never commit real values. .env.example (placeholders only) is
 # tracked deliberately.
 .env

@@ -1,8 +1,8 @@
 //! Local RAG service process management + HTTP client.
 //!
 //! The RAG engine (`packages/rag`) is a separate local-only Python/FastAPI
-//! process, managed here as a child process the same way the PocketSphinx STT
-//! sidecar is managed in `crate::stt`. Unlike the STT sidecar, this one speaks
+//! process, managed here as a child process the same way the local STT/VAD
+//! sidecar is managed in `crate::stt`. Unlike that sidecar, this one speaks
 //! plain request/response HTTP (bound to 127.0.0.1 only) rather than a
 //! stdin/stdout streaming protocol, since document upload and search are
 //! naturally request/response operations, not a continuous stream.

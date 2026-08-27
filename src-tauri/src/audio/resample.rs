@@ -3,8 +3,9 @@ use rubato::{FftFixedIn, Resampler};
 /// Downmixes interleaved multi-channel f32 samples to mono, then resamples from
 /// `in_rate` to `TARGET_SAMPLE_RATE` using a fixed-input-size FFT resampler.
 ///
-/// PocketSphinx expects 16kHz mono PCM; WASAPI's shared-mode mix format is usually
-/// 44.1kHz or 48kHz stereo, so this conversion runs on every captured chunk.
+/// The local sherpa-onnx VAD engine (and Groq's transcription API) both expect
+/// 16kHz mono PCM; WASAPI's shared-mode mix format is usually 44.1kHz or
+/// 48kHz stereo, so this conversion runs on every captured chunk.
 ///
 /// Scratch buffers (`mono_scratch`, `in_block`, `out_block`, `leftover`, `output`)
 /// are allocated once in `new()` and reused across every `process()` call instead
