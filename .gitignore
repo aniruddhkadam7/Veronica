@@ -1,0 +1,46 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+build
+release
+*.local
+
+# Rust / Tauri build output
+src-tauri/target
+src-tauri/gen
+
+# Large prebuilt binary assets — the STT model exceeds GitHub's 100MB
+# per-file limit, and none of these belong in git history anyway (they're
+# large, binary, and unchanged build inputs, not source). See README.md's
+# "Getting the model and sidecar binaries" section for how to obtain them.
+models/
+sidecars/
+
+# Secrets — never commit real values. .env.example (placeholders only) is
+# tracked deliberately.
+.env
+
+# Machine-specific local cargo overrides (e.g. custom target-dir)
+.cargo/
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

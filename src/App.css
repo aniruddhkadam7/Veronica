@@ -1,0 +1,3225 @@
+:root {
+  font-family: "Segoe UI", Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color: #1a1a1a;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+
+  /* Light-mode tokens */
+  --accent: #3b82f6;
+  --accent-hover: #2f6fd8;
+  --accent-soft: rgba(59, 130, 246, 0.1);
+  --success: #22a06b;
+  --success-soft: rgba(34, 160, 107, 0.12);
+  --danger: #e5484d;
+  --danger-hover: #cc3d42;
+  --danger-soft: rgba(229, 72, 77, 0.12);
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.14);
+
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-alt: #f8f9fb;
+  --border: #e3e5e9;
+  --border-strong: #d3d6dc;
+  --text: #17181c;
+  --text-muted: #6b7280;
+  --text-faint: #9aa0a9;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-md: 0 4px 14px rgba(16, 24, 40, 0.08);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+}
+
+/* html/body get the same background as .app-shell so there is no white
+   browser-default gutter around the centered column below.
+
+   This rule reaches the Interview Mode overlay window too — Vite bundles every
+   stylesheet together, so importing App.css from App.tsx does not scope it to
+   the main window. overlay.css overrides it there via `html.overlay-window` /
+   `body.overlay-window`, which main.tsx sets on both elements. Do not rely on
+   import order alone for that: it silently left <html> opaque and made the
+   overlay impossible to see through.
+
+   `.compact-transparent` (same html.X/body.X marker pattern as
+   overlay-window, set by App.tsx while the main window is in its compact
+   toolbar state — not via CSS :has(), to avoid depending on :has() support
+   in whatever WebView2 version is installed) un-does this specifically for
+   that state: the main window is `transparent: true` (tauri.conf.json) so
+   the extra height it grows into for an open header dropdown (see
+   .header-dropdown below) shows nothing at all behind the dropdown box,
+   rather than this app background painted as a visible blank strip/panel
+   around it. The header and the dropdown box itself still paint their own
+   opaque backgrounds — only the truly empty space becomes see-through.
+   Maximized view removes this marker, restoring the normal opaque
+   background. */
+html,
+body {
+  background-color: var(--bg);
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+html.compact-transparent,
+body.compact-transparent {
+  background-color: transparent;
+}
+
+/* Thin, low-contrast scrollbar for every scrollable area in the main window
+   (Settings/History/popover bodies, etc.) — the WebView2 default is a wide,
+   high-contrast classic Windows scrollbar that reads as much heavier UI
+   chrome than the rest of this app. `scrollbar-width`/`scrollbar-color` cover
+   Chromium's modern (non-prefixed) API; the ::-webkit-* rules below are the
+   fallback for whichever WebView2 runtime doesn't yet honor those. Mirrors
+   the slim scrollbar overlay.css already uses for the Interview overlay's
+   chat/question box, just themed for the light main window instead of the
+   overlay's dark one. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--border-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-faint);
+}
+
+#root {
+  height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.app-shell {
+  background-color: var(--bg);
+  color: var(--text);
+}
+
+.app-shell {
+  margin: 0 auto;
+  width: 100%;
+  max-width: 1180px;
+  height: 100vh;
+  overflow: hidden;
+  padding: 0 2rem 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+  box-sizing: border-box;
+}
+
+.app-shell-workspace {
+  max-width: none;
+  padding: 0;
+  gap: 0;
+}
+
+/* Compact (default) state: the whole window is just the header's height, so
+   the shell must not add its own padding/gap around it — any extra space
+   here would clip the header or force the window taller than intended.
+   position: relative makes this the positioning context for .header-dropdown
+   (see App.css below), so its `left`/`right` span the window's own edges
+   rather than some narrower ancestor. background: none pairs with the
+   `.compact-transparent` marker above and the main window's
+   `transparent: true` config — the shell itself paints nothing, so any
+   extra height the window grows into for an open dropdown is genuinely
+   see-through, not a visible grey/white panel. .compact-header below paints
+   its own opaque background so the header row itself still looks solid. */
+/* height: auto (overriding .app-shell's own 100vh) is what keeps this
+   shrink-wrapped to its actual content (88px toolbar, or more with a
+   popover open) instead of stretching to fill the full fixed 760x720
+   window (see main_window.rs) — the window is sized for the tallest
+   possible popover, but the visible card must only ever be as tall as
+   what's actually open, with the rest of the window staying genuinely
+   invisible (.compact-transparent above) rather than showing as a
+   full-height rounded panel with empty space at the bottom. */
+.app-shell-compact {
+  position: relative;
+  max-width: none;
+  height: auto;
+  padding: 0;
+  gap: 0;
+  overflow: visible;
+  background: none;
+}
+
+/* Rounds the visible toolbar into one floating card — the OS window itself
+   is transparent (tauri.conf.json), so the border-radius/border/shadow
+   below (applied to .title-bar and .compact-header individually) is what
+   actually gives the visible window its rounded corners and edge.
+
+   This used to be one rule on .app-shell-compact itself, gated by
+   :not(:has(.header-dropdown)) so it could be skipped while a popover was
+   open (a popover needs to extend past .compact-header's bottom edge,
+   which the wrapper's own overflow: hidden would otherwise clip) — but
+   toggling overflow: hidden on/off on every popover open/close forced a
+   full repaint of the whole subtree each time, which read as a brief
+   "zoom" flash on every click even after the earlier window-resize
+   jitter was fixed. Splitting the styling across the two rows that
+   actually paint pixels removes the need for overflow: hidden (or any
+   :has()-driven toggle) entirely: each row just rounds its own corners
+   and paints its own border/shadow, unconditionally, since
+   .header-dropdown is position: absolute anchored to its own trigger
+   button — it was never inside .compact-header's own box to begin with,
+   so there was nothing that actually needed clipping.
+
+   border/shadow are lifted directly from .btn.primary (the Start button,
+   below) rather than invented separately — same 1px border weight, same
+   layered shadow recipe (colored ambient shadow + inset top highlight +
+   inset bottom lowlight), just re-tinted neutral
+   (var(--border-strong)/rgba(16,24,40,...)) since the whole window can't
+   be Start's accent blue without destroying the white surface underneath
+   every other control. Radius is --radius-lg rather than Start's own
+   --radius-md — a window-sized surface reads as more sharply cut at the
+   same radius a button uses, so it's bumped up a step for a visibly
+   rounded card. Only applied in compact (non-maximized) mode — see
+   .app-shell-compact .title-bar / .compact-header below. */
+
+/* ---------- Header ---------- */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1.1rem 0 1rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.header-logo {
+  width: 28px;
+  height: 28px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+.header-titles {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.header-product {
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
+  font-family: "Segoe UI", Inter, Avenir, Helvetica, Arial, sans-serif;
+  color: var(--text);
+}
+
+.header-page {
+  font-size: 0.76rem;
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.header-status-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.header-timer {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* ---------- Compact header ---------- */
+
+.compact-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  height: 56px;
+  padding: 0 0.6rem;
+  flex-shrink: 0;
+  background-color: var(--surface);
+}
+
+/* Bottom half of the rounded card's edge (see the .title-bar/.compact-header
+   pair's shared comment above .header for the full rationale) — left/right/
+   bottom border + shadow, unconditionally, no popover-state toggle. */
+.app-shell-compact .compact-header {
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  border-left: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.28), inset 0 -1px 1px rgba(0, 0, 0, 0.08);
+}
+
+/* Custom frameless title bar (see tauri.conf.json's decorations: false) —
+   its own slim strip above .compact-header, not sharing that row, so the
+   existing Mode/Model/Context/Start/Settings/Account row and its width
+   stay exactly as they were. The whole strip is a drag region except the
+   buttons themselves (Tauri excludes interactive elements automatically). */
+.title-bar {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  height: 32px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  background-color: var(--surface);
+}
+
+/* Top half of the rounded card's edge — top/left/right border + shadow,
+   unconditionally (see .app-shell-compact .compact-header above). */
+.app-shell-compact .title-bar {
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  border-top: 1px solid var(--border-strong);
+  border-left: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+}
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0 0.4rem;
+  flex-shrink: 0;
+}
+
+/* Same rounded-button language as .compact-header-btn/.window-control-btn's
+   siblings below in the header — small rounded squares instead of the
+   flush-rectangle native title-bar convention, so the title bar reads as
+   part of the same component system as the rest of the toolbar. */
+.window-control-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 24px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.window-control-btn:hover {
+  background: var(--surface-alt);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+.window-control-btn.close:hover {
+  background: var(--danger);
+  border-color: var(--danger-hover);
+  color: #ffffff;
+}
+
+.window-control-btn svg {
+  flex-shrink: 0;
+}
+
+.compact-header-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.compact-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+/* .btn.primary's (Start's) exact recipe, line for line — same color-mix
+   lightened-top-stop technique, same 3-stop 0%/55%/100% gradient shape,
+   same two-layer inset shadow (top highlight + bottom lowlight) plus
+   ambient drop shadow, same border-color-matches-darkest-stop pattern —
+   just with white/--border-strong standing in for --accent/--accent-hover
+   so these read as genuinely white/silver rather than Start's blue,
+   while still having the same visible depth Start has (the earlier
+   #ffffff/--surface/--surface-alt version was too close to a flat white
+   to read as a gradient at all). */
+.compact-header-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.48rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: linear-gradient(180deg, #ffffff 0%, #ffffff 55%, var(--border-strong) 100%);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.9), inset 0 -1px 1px rgba(0, 0, 0, 0.08);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, transform 0.1s ease;
+}
+
+.compact-header-btn:hover {
+  background: linear-gradient(180deg, #ffffff 0%, var(--surface-alt) 55%, var(--border-strong) 100%);
+  border-color: var(--text-faint);
+  box-shadow: 0 3px 10px rgba(16, 24, 40, 0.22), inset 0 1px 0 rgba(255, 255, 255, 1), inset 0 -1px 1px rgba(0, 0, 0, 0.1);
+}
+
+.compact-header-btn:active {
+  transform: translateY(1px);
+}
+
+.compact-header-btn[aria-expanded="true"] {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.compact-header-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+.compact-header-btn.icon {
+  padding: 0.48rem 0.6rem;
+  color: var(--text-muted);
+}
+
+.compact-header-btn.icon:hover {
+  color: var(--text);
+}
+
+.compact-header-btn svg {
+  flex-shrink: 0;
+}
+
+.compact-header-controls > .btn {
+  border-radius: 999px;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.85rem;
+}
+
+.compact-header-error {
+  margin: 0.4rem 0 0;
+}
+
+.dropdown-anchor {
+  position: relative;
+}
+
+.dropdown-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.55rem 0.65rem;
+  border: none;
+  background: none;
+  border-radius: var(--radius-md);
+  font-size: 0.85rem;
+  color: var(--text);
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.dropdown-item:hover {
+  background: var(--surface-alt);
+}
+
+/* Selected item in a dropdown (e.g. the active Mode) — an accent-tinted
+   background/text instead of a checkmark glyph, matching how the app marks
+   other selected states (.workspace-nav-item.active). */
+.dropdown-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.dropdown-item.active:hover {
+  background: var(--accent-soft);
+}
+
+.dropdown-item.highlighted:not(.active) {
+  background: var(--surface-alt);
+}
+
+/* Custom dropdown replacing native <select> everywhere (see Select in
+   ui.tsx) — a trigger button plus a floating .dropdown-item list, so every
+   dropdown in the app shares one look instead of the OS's native popup
+   styling. */
+.select {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+
+.select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  padding: 0.55em 0.7em;
+  font-size: 0.88rem;
+  font-family: inherit;
+  background-color: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.select-trigger:hover {
+  border-color: var(--accent);
+}
+
+.select-trigger:focus-visible,
+.select-trigger[aria-expanded="true"] {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.select-trigger:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.select-trigger-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.select-trigger-caret {
+  flex-shrink: 0;
+  font-size: 0.65em;
+  color: var(--text-muted);
+}
+
+.select-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 60;
+  min-width: max-content;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(16, 24, 40, 0.16);
+  background: var(--surface);
+}
+
+/* Context/Settings/Account still use this same full-screen dimmed shell
+   whenever the window has real room for it (e.g. maximized). In the compact
+   header (see .header-dropdown below), a Tauri window can only ever paint
+   inside its own OS-level bounds — no CSS technique lets content spill past
+   the window's physical edge — so main_window.rs's set_popover_content_height
+   grows the compact window's actual height to fit the open popover, and the
+   nested override just below repositions this same shell to sit anchored
+   under its header button instead of covering the whole window. */
+.popover-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background-color: rgba(16, 24, 40, 0.35);
+  display: flex;
+}
+
+.popover {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: var(--surface);
+  overflow: hidden;
+}
+
+/* Anchored dropdown shell for the compact header (see HeaderDropdown.tsx).
+   Sized to just its own content (widths below, per popover type) and
+   right-aligned under its trigger button — a real compact dropdown, not a
+   panel. Positioned by its inline `top` (just below the 56px header) as a
+   plain `position: absolute` overlay: the main window is a fixed 760x720
+   from launch (see main_window.rs) and never resizes for a popover, so
+   this never needs the window itself to grow — it just occupies space the
+   window already has. max-height caps it to what actually fits inside
+   that fixed window (720 total - 88 toolbar - GAP_ABOVE/below - a little
+   breathing room) with overflow-y: auto as the scroll fallback for
+   anything taller (e.g. Settings' long Sessions history). */
+.header-dropdown {
+  position: absolute;
+  right: 0;
+  z-index: 50;
+  max-height: 600px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 12px 32px rgba(16, 24, 40, 0.14), 0 2px 8px rgba(16, 24, 40, 0.06);
+  background: var(--surface);
+}
+
+.header-dropdown.header-dropdown-menu {
+  width: 180px;
+}
+
+.header-dropdown.header-dropdown-panel {
+  width: 300px;
+}
+
+/* Settings needs more width than Account for its two-column nav+content
+   layout (.settings-popover-body below) to have room for both. Its Sessions
+   section (past Interview/Meeting history) can run to many entries or a
+   long transcript — .settings-popover-content's max-height below caps how
+   tall HeaderDropdown ever grows the OS window, with overflow-y: auto
+   scrolling the rest instead of growing without bound the way short
+   menus/forms do. */
+.header-dropdown.header-dropdown-settings {
+  width: 560px;
+}
+
+.header-dropdown.header-dropdown-settings .settings-popover-content {
+  max-height: 480px;
+  overflow-y: auto;
+}
+
+/* Context, upload-file rows only (see .header-dropdown .setup-textarea
+   below) — a bit narrower than the other panels reads fine since there's
+   no paste-text box needing room to be usable. */
+.header-dropdown.header-dropdown-wide {
+  width: 280px;
+}
+
+/* The nested override promised above: Context/Settings/Account's own
+   .popover-overlay/.popover shell, unmodified, now sizing to its content
+   inside a small anchored dropdown instead of covering the whole window. */
+.header-dropdown .popover-overlay {
+  position: static;
+  inset: auto;
+  background: none;
+  height: auto;
+}
+
+.header-dropdown .popover {
+  height: auto;
+}
+
+/* Mode's dropdown is just a short list of .dropdown-item options. */
+.header-dropdown-mode {
+  padding: 0.35rem;
+}
+
+/* Model-provider dropdown — same short-list shell as Mode's, just with a
+   logo per row (see .dropdown-item-icon below). */
+.header-dropdown-model {
+  padding: 0.35rem;
+}
+
+.dropdown-item-icon {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.dropdown-item-icon:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.dropdown-item-icon:disabled:hover {
+  background: none;
+}
+
+.dropdown-item-badge {
+  margin-left: auto;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: var(--surface-alt);
+  color: var(--text-muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+/* DocumentContext's .setup-sections is a 3-column grid designed for the
+   full-width setup screen; at the Context dropdown's compact 360px it
+   needs to stack as a single narrow column instead. The paste-text
+   textarea is also hidden here — dropping it (upload-file only) is what
+   keeps three sections fitting with zero scrolling; pasting text is still
+   fully available from the full Preparation/setup screen elsewhere.
+   Presentational only — DocumentContext itself is unchanged, so a file
+   already uploaded (or, in principle, pasted text carried over from
+   elsewhere) still shows its filename chip normally. */
+.header-dropdown .setup-sections {
+  grid-template-columns: 1fr;
+  gap: 0.3rem;
+}
+
+.header-dropdown .setup-section {
+  padding: 0.5rem 0.6rem;
+  gap: 0.3rem;
+}
+
+.header-dropdown .setup-textarea {
+  display: none;
+}
+
+/* Settings popover: nav rail on the left, selected section's content on
+   the right — a standard settings-dialog layout, rather than stacking the
+   nav above the content in one narrow column. */
+.settings-popover-body {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.settings-popover-nav {
+  flex-shrink: 0;
+  width: 180px;
+}
+
+.settings-popover-content {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 260px;
+  padding-top: 0.2rem;
+}
+
+.popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.6rem;
+  min-height: 32px;
+  flex-shrink: 0;
+  gap: 0.5rem;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.popover-header .setup-section-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.popover-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.6rem;
+}
+
+.popover-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border);
+}
+
+/* Segmented tab group — Performance's Adaptive/Maximum Performance/Battery
+   Saver picker and Account's Sign in/Sign up toggle. Wraps rather than
+   forcing a single row: Performance's three labels don't fit one line at
+   the popover's width, and without explicit sizing here the buttons had no
+   layout at all (ran together as unstyled inline text), which is also what
+   made picking a mode look like it was "hiding" the panel — the whole
+   popover reflowing/resizing around content with no stable box to click. */
+.agent-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+}
+
+.agent-mode-tab {
+  flex: 1 1 auto;
+  min-width: max-content;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.agent-mode-tab:hover:not(:disabled) {
+  background: var(--surface-alt);
+}
+
+.agent-mode-tab.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.agent-mode-tab:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ---------- Status dots / badges ---------- */
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.status-dot.success {
+  background-color: var(--success);
+}
+
+.status-dot.danger {
+  background-color: var(--danger);
+}
+
+.status-dot.warning {
+  background-color: var(--warning);
+}
+
+.status-dot.accent {
+  background-color: var(--accent);
+}
+
+.status-dot.neutral {
+  background-color: var(--text-faint);
+}
+
+.status-dot.pulse {
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(229, 72, 77, 0.45);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(229, 72, 77, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(229, 72, 77, 0);
+  }
+}
+
+.badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.25em 0.65em;
+  border-radius: 999px;
+  background-color: var(--surface-alt);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.badge.success {
+  background-color: var(--success-soft);
+  color: var(--success);
+}
+
+.badge.warning {
+  background-color: var(--warning-soft);
+  color: var(--warning);
+}
+
+.badge.danger {
+  background-color: var(--danger-soft);
+  color: var(--danger);
+}
+
+.badge.accent {
+  background-color: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ---------- Home / landing ---------- */
+
+.home-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  justify-content: center;
+  gap: clamp(1.5rem, 4vh, 2.75rem);
+  padding: clamp(1.5rem, 6vh, 3.5rem) 0 1rem;
+}
+
+.home-hero {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  max-width: 760px;
+}
+
+.home-hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+  max-width: 560px;
+}
+
+.home-hero-actions {
+  flex-shrink: 0;
+}
+
+.home-eyebrow {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.home-title {
+  margin: 0;
+  font-size: clamp(1.8rem, 3.2vh + 1rem, 2.4rem);
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  line-height: 1.12;
+  color: var(--text);
+}
+
+.home-subtitle {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+  max-width: 480px;
+}
+
+.home-modes {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+.mode-tile {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.85rem;
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface);
+  padding: 1.5rem 1.35rem 1.65rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.mode-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+
+.mode-tile:active {
+  transform: translateY(0);
+}
+
+.mode-tile.primary {
+  border-color: var(--accent);
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface) 60%, var(--accent-soft) 220%);
+}
+
+.mode-tile:not(.primary) {
+  color: inherit;
+}
+
+.mode-tile:not(.primary) .mode-tile-title {
+  opacity: 0.82;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-tile {
+    transition: none;
+  }
+  .mode-tile:hover {
+    transform: none;
+  }
+}
+
+.mode-tile-top {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  width: 100%;
+}
+
+.mode-tile-title {
+  font-size: 1.02rem;
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+.mode-tile-description {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  flex: 1;
+}
+
+.mode-tile-badge {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.28em 0.6em;
+  border-radius: 999px;
+  background-color: var(--surface-alt);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.mode-tile-cta {
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--accent);
+}
+
+@media (max-width: 720px) {
+  .home-modes {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .home-hero {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
+
+.workspace-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.workspace-nav-item {
+  display: flex;
+  align-items: center;
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.65rem;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.workspace-nav-item:hover {
+  background-color: var(--surface-alt);
+  color: var(--text);
+}
+
+.workspace-nav-item.active {
+  background-color: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 650;
+}
+
+/* ---------- Interview setup ---------- */
+
+.setup-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  gap: clamp(0.75rem, 1.6vh, 1.1rem);
+  padding: clamp(0.5rem, 1.4vh, 0.9rem) 0 clamp(0.5rem, 1.4vh, 0.85rem);
+  overflow-y: auto;
+}
+
+/* A single, consistent-width column for form content (agent creation,
+   instructions, personalization) — replaces ad-hoc per-section maxWidth
+   inline styles so the stacked cards line up on one clean edge instead of
+   each choosing its own width. */
+.setup-form-column {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  max-width: 620px;
+  width: 100%;
+}
+
+.setup-add-more {
+  align-self: flex-start;
+  font-size: 0.85rem;
+}
+
+.setup-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.setup-hero-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.setup-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex-shrink: 0;
+}
+
+.setup-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.setup-subtitle {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.setup-identity {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.setup-identity + .setup-identity {
+  margin-top: 0.5rem;
+}
+
+.setup-identity-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.setup-identity-field label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+}
+
+.setup-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  font-weight: 400;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.setup-input {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.86rem;
+  color: var(--text);
+  background-color: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 0.5rem 0.7rem;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.setup-input::placeholder {
+  color: var(--text-faint);
+}
+
+.setup-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.setup-select {
+  width: 100%;
+}
+
+.setup-select .select-trigger {
+  width: 100%;
+  font-family: inherit;
+  font-size: 0.86rem;
+  color: var(--text);
+  background-color: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 0.5rem 0.7rem;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.setup-select .select-trigger:focus-visible,
+.setup-select .select-trigger[aria-expanded="true"] {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.setup-sections {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  flex-shrink: 0;
+}
+
+.setup-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+  min-height: 0;
+  min-width: 0;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.setup-section:hover {
+  box-shadow: 0 2px 5px rgba(16, 24, 40, 0.08);
+  border-color: var(--border-strong);
+}
+
+.setup-section + .setup-section,
+.setup-section + .link-button,
+.link-button + .setup-section {
+  margin-top: 0.35rem;
+}
+
+.setup-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.setup-section-label {
+  font-size: 0.88rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.setup-section-optional {
+  font-size: 0.64rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.setup-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.setup-section-body .btn.secondary {
+  background-color: #ffffff;
+  border: 1px solid #aab0bb;
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+}
+
+.setup-section-body .btn.secondary:hover:not(:disabled) {
+  background-color: #ffffff;
+  border-color: #6b7280;
+  color: #2b2f36;
+}
+
+.setup-textarea {
+  width: 100%;
+  height: 110px;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 0.82rem;
+  color: var(--text);
+  background-color: #ffffff;
+  border: 1px solid #aab0bb;
+  border-radius: var(--radius-md);
+  padding: 0.6rem 0.7rem;
+  line-height: 1.5;
+  box-shadow: inset 0 1px 2px rgba(16, 24, 40, 0.06);
+}
+
+.setup-textarea::placeholder {
+  color: #8a8f99;
+}
+
+.setup-textarea:focus {
+  outline: none;
+  border-color: #6b7280;
+  box-shadow: 0 0 0 3px rgba(107, 114, 128, 0.18);
+}
+
+.setup-file-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  background-color: #ffffff;
+  border: 1px solid #aab0bb;
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+}
+
+.setup-file-name {
+  font-size: 0.8rem;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.setup-file-chip .link-button {
+  flex-shrink: 0;
+}
+
+.setup-hero-actions .btn.primary {
+  background-color: #2b2f36;
+  border-color: #2b2f36;
+}
+
+.setup-hero-actions .btn.primary:hover:not(:disabled) {
+  background-color: #454b54;
+  border-color: #454b54;
+}
+
+.setup-focus {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid #c7cbd3;
+  border-radius: var(--radius-lg);
+  background-color: #f8f9fb;
+  flex-shrink: 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.setup-focus-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.setup-focus-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+}
+
+.setup-focus-status {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.setup-focus-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.setup-focus-line {
+  margin: 0;
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.setup-focus-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.setup-focus-label {
+  font-size: 0.7rem;
+  font-weight: 650;
+  color: #6b7280;
+}
+
+.setup-focus-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.setup-focus-chip {
+  font-size: 0.74rem;
+  color: var(--text);
+  background-color: #ffffff;
+  border: 1px solid #d5d8de;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
+}
+
+.setup-style-anchor {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.setup-style-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.9rem;
+  background-color: #ffffff;
+  border: 1px solid #aab0bb;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.84rem;
+  font-weight: 650;
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08);
+}
+
+.setup-style-toggle:hover {
+  border-color: #6b7280;
+}
+
+.setup-style-caret {
+  font-size: 0.65rem;
+  color: #6b7280;
+}
+
+.setup-style-popover {
+  position: absolute;
+  top: calc(100% + 0.4rem);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  width: 260px;
+  padding: 0.9rem;
+  border: 1px solid #c7cbd3;
+  border-radius: var(--radius-lg);
+  background-color: #ffffff;
+  box-shadow: var(--shadow-md, 0 8px 24px rgba(16, 24, 40, 0.14));
+}
+
+.setup-style-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.setup-style-field label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+}
+
+@media (max-width: 760px) {
+  .setup-hero {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .setup-hero-actions {
+    justify-content: space-between;
+  }
+
+  .setup-style-popover {
+    left: 0;
+    right: 0;
+    width: auto;
+  }
+
+  .setup-sections {
+    grid-template-columns: 1fr;
+    overflow-y: auto;
+  }
+}
+
+/* ---------- Interview history (main area) ---------- */
+
+.history-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.history-empty {
+  font-size: 0.88rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.history-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.history-entry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  text-align: left;
+  font-family: inherit;
+  width: 100%;
+  padding: 0.9rem 1.1rem;
+  background-color: #ffffff;
+  border: 1px solid #c7cbd3;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.history-entry-card:hover {
+  border-color: #6b7280;
+  box-shadow: var(--shadow-md);
+}
+
+/* Inside a modal, sections read as one continuous form rather than a stack
+   of separate bordered/shadowed cards — the card treatment belongs to the
+   full-page setup views (Instructions/Personalization tabs, old setup
+   pages), not a compact popup. Flat label + fields, with a thin divider
+   between top-level blocks (Role, role questions, Knowledge, Personalization,
+   ...) instead of each one being its own bordered box. */
+.modal-body .setup-section {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  gap: 0.5rem;
+}
+
+.modal-body .setup-section:hover {
+  box-shadow: none;
+  border-color: transparent;
+}
+
+.modal-body .setup-section-head {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.modal-body .setup-section-body .btn.secondary {
+  background-color: var(--surface-alt);
+  box-shadow: none;
+}
+
+.modal-body > * {
+  margin: 0;
+}
+
+.modal-body > * + * {
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--border);
+}
+
+.history-entry-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.history-entry-title {
+  font-size: 0.95rem;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.history-entry-duration {
+  font-size: 0.74rem;
+  color: var(--text-faint);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.history-entry-when {
+  font-size: 0.76rem;
+  color: #6b7280;
+}
+
+.history-entry-preview {
+  margin: 0.2rem 0 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Compact variant: Sessions renders History inline inside Settings'
+   content pane (settings-popover-content) rather than as its own full-page
+   view, so the hero title/spacing/card padding that suit a standalone
+   dashboard page read as oversized there — this tightens it down to match
+   the rest of Settings' sections. */
+.settings-popover-content .history-view {
+  gap: 0.6rem;
+}
+
+.settings-popover-content .setup-hero {
+  gap: 0.15rem;
+}
+
+.settings-popover-content .setup-title {
+  font-size: 0.95rem;
+}
+
+.settings-popover-content .setup-subtitle {
+  font-size: 0.78rem;
+}
+
+.settings-popover-content .history-entries {
+  gap: 0.4rem;
+}
+
+.settings-popover-content .history-entry-card {
+  padding: 0.55rem 0.7rem;
+  gap: 0.15rem;
+  border-radius: var(--radius-sm);
+  box-shadow: none;
+}
+
+.settings-popover-content .history-entry-title {
+  font-size: 0.85rem;
+}
+
+.settings-popover-content .history-entry-when {
+  font-size: 0.72rem;
+}
+
+.settings-popover-content .history-entry-preview {
+  font-size: 0.78rem;
+  margin-top: 0.1rem;
+}
+
+.settings-popover-content .history-view-title {
+  font-size: 1rem;
+}
+
+.settings-popover-content .history-view-subtitle {
+  font-size: 0.76rem;
+}
+
+.settings-popover-content .history-view-transcript {
+  gap: 0.7rem;
+}
+
+.settings-popover-content .history-turn-block {
+  gap: 0.3rem;
+  padding-bottom: 0.7rem;
+}
+
+.settings-popover-content .history-turn-text {
+  font-size: 0.85rem;
+}
+
+.agent-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.9rem 1.1rem;
+  background-color: #ffffff;
+  border: 1px solid #c7cbd3;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.agent-card:hover {
+  border-color: #6b7280;
+  box-shadow: var(--shadow-md);
+}
+
+.agent-card-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  font-family: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.agent-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.agent-card-menu-wrap {
+  position: relative;
+}
+
+.agent-card-menu-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  font-family: inherit;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--text-muted);
+  background-color: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.agent-card-menu-btn:hover {
+  background-color: var(--surface-alt);
+  color: var(--text);
+  border-color: #6b7280;
+}
+
+.agent-card-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: 0.35rem;
+  background-color: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.agent-card-menu button {
+  text-align: left;
+  font-family: inherit;
+  font-size: 0.84rem;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+}
+
+.agent-card-menu button:hover {
+  background-color: var(--surface-alt);
+}
+
+.agent-card-menu button.danger {
+  color: var(--danger);
+}
+
+.agent-card-menu button.danger:hover {
+  background-color: var(--danger-soft);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background-color: rgba(16, 24, 40, 0.45);
+  box-sizing: border-box;
+}
+
+.modal-panel {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 420px;
+  max-height: min(85vh, 720px);
+  min-height: 0;
+  background-color: #ffffff;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.agent-create-modal {
+  max-width: 620px;
+  /* Content is short by design (a handful of fields, everything else
+     collapsed behind "+ Knowledge" / "+ Personalize"), so this cap exists
+     only as a safety net on a very short window — it should not be hit in
+     normal use, and .modal-body's scroll only engages if it is. */
+  max-height: min(94vh, 900px);
+}
+
+.agent-create-modal .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.modal-header .setup-title {
+  font-size: 1.05rem;
+}
+
+.modal-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.modal-close-btn:hover {
+  background-color: var(--surface-alt);
+  color: var(--text);
+}
+
+.modal-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 1.25rem;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  padding: 1rem 1.25rem;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.history-view-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+.history-view-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  flex-shrink: 0;
+}
+
+.history-view-title {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.history-view-subtitle {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--text-muted);
+}
+
+.history-view-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 1.1rem;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+.history-turn-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-bottom: 1.1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-turn-block:last-child {
+  border-bottom: none;
+}
+
+.history-turn-q-row,
+.history-turn-a-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.history-turn-tag {
+  font-size: 0.66rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+.history-turn-tag.accent {
+  color: #454b54;
+}
+
+.history-turn-text {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.mode-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.25rem;
+  flex: 1;
+  padding: 2rem 0;
+}
+
+/* ---------- Buttons ---------- */
+
+.btn {
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  padding: 0.62em 1.3em;
+  font-size: 0.88em;
+  font-weight: 600;
+  font-family: inherit;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s, background 0.15s, box-shadow 0.15s, transform 0.05s, opacity 0.15s, filter 0.15s;
+  box-shadow: var(--shadow-sm);
+  color: var(--text);
+  background-color: var(--surface);
+}
+
+.btn:hover:not(:disabled) {
+  filter: brightness(1.02);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn.sm {
+  padding: 0.38em 0.85em;
+  font-size: 0.78rem;
+}
+
+.btn-spinner {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+}
+
+.spinner {
+  display: inline-block;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #ffffff;
+  animation: spin 0.7s linear infinite;
+}
+
+/* Dark-on-light contexts (e.g. a spinner outside a filled primary button)
+   want a dark ring rather than the white one above. */
+.spinner.on-light {
+  border-color: rgba(0, 0, 0, 0.15);
+  border-top-color: var(--accent);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.btn.primary {
+  color: #ffffff;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 100%, #fff 12%) 0%, var(--accent) 55%, var(--accent-hover) 100%);
+  border-color: var(--accent-hover);
+  box-shadow: 0 2px 6px rgba(59, 130, 246, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -1px 1px rgba(0, 0, 0, 0.08);
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hover) 100%, #fff 12%) 0%, var(--accent-hover) 55%, var(--accent-hover) 100%);
+  border-color: var(--accent-hover);
+  box-shadow: 0 3px 10px rgba(59, 130, 246, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.4), inset 0 -1px 1px rgba(0, 0, 0, 0.1);
+}
+
+.btn.danger {
+  color: #ffffff;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--danger) 100%, #fff 12%) 0%, var(--danger) 55%, var(--danger-hover) 100%);
+  border-color: var(--danger-hover);
+  box-shadow: 0 2px 6px rgba(229, 72, 77, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.35), inset 0 -1px 1px rgba(0, 0, 0, 0.08);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--danger-hover) 100%, #fff 12%) 0%, var(--danger-hover) 55%, var(--danger-hover) 100%);
+  border-color: var(--danger-hover);
+  box-shadow: 0 3px 10px rgba(229, 72, 77, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.4), inset 0 -1px 1px rgba(0, 0, 0, 0.1);
+}
+
+.btn.secondary {
+  color: var(--text);
+  background: linear-gradient(180deg, #ffffff 0%, var(--surface) 55%, var(--surface-alt) 100%);
+  border-color: var(--border-strong);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.btn.secondary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #ffffff 0%, var(--surface-alt) 55%, var(--surface-alt) 100%);
+  border-color: var(--text-faint);
+  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+}
+
+.btn.ghost {
+  color: var(--text-muted);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.btn.ghost:hover:not(:disabled) {
+  background: linear-gradient(180deg, var(--surface-alt) 0%, var(--surface-alt) 100%);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+/* legacy alias for a couple of raw <button className="link-button"> spots */
+.link-button {
+  background: none;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  color: var(--danger);
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+/* ---------- Cards ---------- */
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface);
+  box-shadow: var(--shadow-sm);
+  padding: 1.35rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  margin-bottom: -0.25rem;
+}
+
+.card-title {
+  margin: 0;
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+/* ---------- Empty states ---------- */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 2.25rem 1.5rem;
+  color: var(--text-muted);
+  gap: 0.3rem;
+}
+
+.empty-state-icon {
+  font-size: 1.6rem;
+  margin-bottom: 0.4rem;
+  opacity: 0.6;
+}
+
+.empty-state-title {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+
+.empty-state-description {
+  font-size: 0.82rem;
+  color: var(--text-faint);
+  margin: 0;
+  max-width: 32em;
+  line-height: 1.5;
+}
+
+/* ---------- Skeleton ---------- */
+
+.skeleton {
+  display: inline-block;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--surface-alt) 25%, var(--border) 37%, var(--surface-alt) 63%);
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0 50%;
+  }
+}
+
+/* ---------- Recording panel ---------- */
+
+.level-meter {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background-color: var(--border);
+  overflow: hidden;
+}
+
+.level-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), #6ea8ff);
+  transition: width 80ms linear;
+}
+
+.controls-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.controls-row-secondary {
+  margin-left: auto;
+}
+
+.error {
+  color: var(--danger);
+  font-size: 0.85rem;
+  text-align: center;
+  background-color: var(--danger-soft);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.8rem;
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  padding: 1rem;
+}
+
+.hint.small {
+  font-size: 0.78rem;
+  padding: 0.4rem 0;
+  text-align: left;
+}
+
+/* ---------- Transcript panel ---------- */
+
+.transcript-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 280px;
+  background-color: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.transcript-panel-header {
+  padding: 0.85rem 1.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  background-color: var(--surface-alt);
+  flex-shrink: 0;
+}
+
+.transcript-panel-live {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--danger);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.transcript-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.1rem 1.25rem;
+  min-height: 0;
+  scroll-behavior: smooth;
+}
+
+.transcript-entry {
+  display: flex;
+  gap: 0.9rem;
+  margin-bottom: 1.1rem;
+}
+
+.transcript-entry-time {
+  flex-shrink: 0;
+  width: 3.4em;
+  padding-top: 0.15em;
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.transcript-entry-text {
+  font-size: 0.94rem;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.transcript-entry.partial {
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--accent);
+}
+
+.transcript-entry.partial .transcript-entry-text {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.transcript-entry.partial .transcript-entry-time {
+  color: var(--accent);
+}
+
+/* ---------- Summary card ---------- */
+
+.summary-card {
+  text-align: center;
+}
+
+.summary-card h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.summary-stats {
+  display: flex;
+  justify-content: center;
+  gap: 2.5rem;
+}
+
+.summary-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.summary-label {
+  font-size: 0.74rem;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.summary-value {
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.summary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6rem;
+}
+
+.export-message {
+  margin-top: -0.4rem;
+  font-size: 0.82rem;
+  color: var(--success);
+  font-weight: 600;
+}
+
+.analysis-progress {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.analysis-progress p {
+  margin: 0.2rem 0;
+}
+
+.analysis-progress-step {
+  font-style: italic;
+}
+
+/* ---------- Preparation panel ---------- */
+
+.prep-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.prep-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.prep-fields-row {
+  display: flex;
+  gap: 1rem;
+}
+
+.prep-fields-row .prep-field {
+  flex: 1;
+}
+
+/* ---------- Personalization panel (Settings > Personalization) ---------- */
+/* Compact label+dropdown rows (like .overlay-settings-row) rather than
+   stacked label-above-input fields — three short controls read better as a
+   tight list than as a form with room to spare. */
+
+.personalization-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.personalization-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.personalization-row label {
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.personalization-row .setup-select {
+  width: 150px;
+  flex-shrink: 0;
+}
+
+.personalization-row .select-trigger {
+  padding: 0.4em 0.6em;
+  font-size: 0.82rem;
+}
+
+.prep-field label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.prep-field input,
+.upload-row input,
+.search-input {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  padding: 0.55em 0.8em;
+  font-size: 0.88rem;
+  font-family: inherit;
+  background-color: var(--surface);
+  color: var(--text);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.prep-field input:focus,
+.upload-row input:focus,
+.search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.upload-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: stretch;
+}
+
+.upload-row .select {
+  flex-shrink: 0;
+  width: 150px;
+}
+
+.search-input {
+  flex: 1;
+}
+
+.upload-dropzone {
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  text-align: center;
+  background-color: var(--surface-alt);
+}
+
+.upload-dropzone-icon {
+  font-size: 1.4rem;
+  opacity: 0.6;
+}
+
+.kb-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.kb-header h2 {
+  margin: 0;
+}
+
+.kb-stats {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.kb-stat-pill {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  background-color: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.3em 0.75em;
+  font-weight: 600;
+}
+
+.kb-stat-pill strong {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.document-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.document-list-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.85rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--surface-alt);
+  border: 1px solid var(--border);
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.document-list-item-main {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.document-filename {
+  font-size: 0.87rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-type-tag {
+  font-size: 0.66rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  padding: 0.15em 0.5em;
+  border-radius: 5px;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.document-list-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  font-size: 0.76rem;
+  color: var(--text-faint);
+}
+
+.error-text {
+  color: var(--danger);
+}
+
+.kb-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ---------- Attached documents panel (Settings > Context/Documents) ---------- */
+
+.attached-documents-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.attached-documents-panel .setup-hint {
+  margin: 0;
+}
+
+.settings-popover-content .document-list-item {
+  padding: 0.5rem 0.7rem;
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.search-result-item {
+  background-color: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.6rem 0.8rem;
+}
+
+.search-result-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 0.3rem;
+}
+
+.search-result-score {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.search-result-text {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+/* ---------- Results dashboard ---------- */
+
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: -0.5rem;
+}
+
+.results-header h2 {
+  margin: 0;
+  font-weight: 700;
+}
+
+.ai-disclaimer {
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  font-style: italic;
+  margin: -0.5rem 0 0;
+}
+
+.results-tab-bar {
+  display: flex;
+  gap: 0.25rem;
+  background-color: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 0.25rem;
+  width: fit-content;
+  flex-wrap: wrap;
+}
+
+.results-tab-button {
+  background: none;
+  box-shadow: none;
+  border: none;
+  border-radius: calc(var(--radius-md) - 4px);
+  padding: 0.4em 0.9em;
+  font-weight: 600;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.results-tab-button:hover {
+  color: var(--text);
+}
+
+.results-tab-button.active {
+  color: var(--text);
+  background-color: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.overall-score-display {
+  text-align: center;
+}
+
+.overall-score-value {
+  font-size: 3rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.overall-score-max {
+  font-size: 1.2rem;
+  color: var(--text-faint);
+}
+
+.overview-summary {
+  font-size: 0.9rem;
+  color: var(--text);
+  opacity: 0.85;
+  text-align: center;
+}
+
+.score-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.score-row {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.score-label {
+  width: 150px;
+  flex-shrink: 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+
+.score-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background-color: var(--border);
+  overflow: hidden;
+}
+
+.score-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--success));
+}
+
+.score-value {
+  width: 30px;
+  text-align: right;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.question-list {
+  margin: 0.3rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}
+
+.question-list.large {
+  font-size: 0.92rem;
+  line-height: 1.8;
+}
+
+.question-list li {
+  margin-bottom: 0.2rem;
+}
+
+.questions-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.question-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1rem 1.15rem;
+  background-color: var(--surface-alt);
+}
+
+.question-card-failed {
+  border-color: var(--danger);
+  border-width: 1px;
+}
+
+.question-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.8rem;
+  margin-bottom: 0.6rem;
+}
+
+.question-text {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.question-score {
+  flex-shrink: 0;
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--accent);
+}
+
+.question-section {
+  margin-bottom: 0.75rem;
+}
+
+.question-section:last-child {
+  margin-bottom: 0;
+}
+
+.question-section-label {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-bottom: 0.25rem;
+}
+
+.question-section-body {
+  font-size: 0.87rem;
+  line-height: 1.5;
+  margin: 0;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+.improved-answer {
+  background-color: var(--accent-soft);
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-sm);
+  margin-bottom: 0.5rem;
+}
+
+.sources-list {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.source-item {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.55rem 0.75rem;
+}
+
+.source-item-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.source-item-score {
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+.source-item-text {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text);
+  opacity: 0.75;
+  line-height: 1.45;
+}
+
+/* ---------- Overlay tracked-item panels (Sales / Consulting) ---------- */
+
+.tracked-panel {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline, rgba(255, 255, 255, 0.12));
+  max-height: 34vh;
+  overflow-y: auto;
+}
+
+.tracked-panel-5 {
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.tracked-col {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tracked-col-label {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, rgba(255, 255, 255, 0.6));
+}
+
+.tracked-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 90px;
+  overflow-y: auto;
+}
+
+.tracked-chip {
+  font-size: 10.5px;
+  line-height: 1.35;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text, #f4f4f5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  overflow-wrap: anywhere;
+}
+
+.tracked-chip.warn {
+  background: rgba(217, 119, 6, 0.18);
+  border-color: rgba(217, 119, 6, 0.35);
+}
+
+.tracked-chip.good {
+  background: rgba(34, 160, 107, 0.18);
+  border-color: rgba(34, 160, 107, 0.35);
+}
+
+.tracked-add-row {
+  display: flex;
+}
+
+.tracked-add-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  color: var(--text, #f4f4f5);
+  font: inherit;
+  font-size: 10.5px;
+  padding: 3px 6px;
+}
+
+.tracked-add-input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* ---------- Notes workspace ---------- */
+
+.notes-list-pane {
+  flex-shrink: 0;
+  width: 280px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background-color: var(--surface-alt);
+}
+
+.notes-list {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.notes-list-head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.85rem 0.85rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.notes-list-items {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.notes-list-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  text-align: left;
+  font-family: inherit;
+  padding: 0.6rem 0.7rem;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+
+.notes-list-item:hover {
+  border-color: var(--border-strong);
+}
+
+.notes-list-item.active {
+  border-color: var(--accent);
+  background-color: var(--accent-soft);
+}
+
+.notes-list-item-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.notes-list-item-title {
+  font-size: 0.86rem;
+  font-weight: 650;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notes-list-item-date {
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.notes-list-item-preview {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-editor {
+  display: flex;
+  gap: 1.25rem;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.note-editor-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  overflow-y: auto;
+}
+
+.note-editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.note-title-input {
+  flex: 1;
+  font-size: 1.1rem;
+  font-weight: 650;
+}
+
+.note-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+.note-body-textarea {
+  flex: 1;
+  min-height: 240px;
+  resize: vertical;
+  font-family: inherit;
+  font-size: 0.9rem;
+  color: var(--text);
+  background-color: #ffffff;
+  border: 1px solid #aab0bb;
+  border-radius: var(--radius-md);
+  padding: 0.75rem 0.9rem;
+  line-height: 1.6;
+  box-shadow: inset 0 1px 2px rgba(16, 24, 40, 0.06);
+}
+
+.note-body-textarea:focus {
+  outline: none;
+  border-color: #6b7280;
+  box-shadow: 0 0 0 3px rgba(107, 114, 128, 0.18);
+}
+
+.note-links {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.note-links-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.note-link-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem;
+  background-color: var(--surface-alt);
+}
+
+.note-link-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--text);
+}
+
+.note-ai-panel {
+  flex-shrink: 0;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background-color: var(--surface-alt);
+  padding: 0.5rem;
+  align-self: flex-start;
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+.note-ai-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 0.5rem 0.25rem;
+}
+
+.note-ai-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.note-ai-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 1.5rem;
+  padding: 0.65rem 1rem;
+  background-color: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.update-banner-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.update-banner-error {
+  color: var(--danger);
+}
+

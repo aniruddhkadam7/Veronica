@@ -1,0 +1,70 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+description = "Smallbird Local — personal desktop build with your own AI API key"
+authors = ["you"]
+edition = "2021"
+default-run = "desktop"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasapi = "0.24.0"
+crossbeam-channel = "0.5.16"
+log = "0.4.33"
+env_logger = "0.11.11"
+rubato = "0.15"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-fs = "2.5.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "blocking", "multipart", "stream", "rustls"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+windows = { version = "0.61", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_Security",
+] }
+sysinfo = "0.32"
+tauri-plugin-global-shortcut = "2.3.2"
+keyring = { version = "3", features = ["windows-native"] }
+# App Paths / Start Menu shortcut lookup for Veronica's action system (see
+# src/actions/native.rs) — already resolved transitively (e.g. via keyring),
+# declared directly here since we call it ourselves rather than relying on
+# an internal dependency's copy.
+winreg = "0.55"
+# Declared directly (not just relied on transitively) so
+# `rustls::crypto::ring::default_provider().install_default()` can be called
+# explicitly at process start — see src/tls_init.rs for why this is needed
+# by every HTTPS reqwest::Client in this crate, including the direct AI
+# provider calls in src/personal/providers/.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = ["time"] }
+# Already pulled in transitively by rustls's "ring" feature above — declared
+# directly only so its CSPRNG (SystemRandom) can be used to generate the RAG
+# service's per-launch internal auth token (see src/rag/process.rs). Adds no
+# new crate to the dependency tree.
+ring = "0.17"
+

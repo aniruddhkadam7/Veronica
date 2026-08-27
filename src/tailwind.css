@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+/* Maps the app's existing App.css color tokens (see :root in App.css) into
+   Tailwind v4 theme variables, so utilities like bg-primary/text-ring resolve
+   to the app's real palette instead of Tailwind's defaults. Kept in sync by
+   hand with App.css's :root block since that file remains the source of
+   truth for the rest of the app's styling. */
+@theme {
+  --color-primary: #3b82f6;
+  --color-primary-hover: #2f6fd8;
+  --color-primary-foreground: #ffffff;
+
+  --color-destructive: #e5484d;
+  --color-destructive-hover: #cc3d42;
+
+  --color-secondary: #f8f9fb;
+  --color-secondary-foreground: #17181c;
+
+  --color-accent: #f8f9fb;
+  --color-accent-foreground: #17181c;
+
+  --color-muted: #f8f9fb;
+  --color-muted-foreground: #6b7280;
+
+  --color-background: #ffffff;
+  --color-foreground: #17181c;
+  --color-border: #d3d6dc;
+  --color-input: #d3d6dc;
+  --color-ring: #3b82f6;
+
+  --radius-md: 6px;
+}

@@ -1,0 +1,835 @@
+/* Interview Mode overlay — a small, translucent floating chat window.
+   Kept in its own stylesheet since the overlay body must stay fully
+   transparent (no card/app background) unlike the main app shell. */
+
+/* Only applied when main.tsx adds the "overlay-window" class to <body>
+   (i.e. this is the Interview Mode window, not the main window) — see
+   main.tsx. Scoped rather than a bare html/body selector so importing this
+   stylesheet unconditionally in main.tsx can never affect the main window's
+   background. */
+/* <html> must be transparent too, not just <body>. WebView2 paints the
+   document canvas from the root element, and App.css sets an opaque
+   `html, body { background-color: var(--bg) }` that reaches this window as
+   well (Vite bundles all CSS together regardless of which component imported
+   it). Both elements carry the `overlay-window` class — see main.tsx. */
+html.overlay-window,
+body.overlay-window,
+body.overlay-window #root {
+  background: transparent !important;
+  margin: 0;
+}
+
+.overlay-root {
+  /* --overlay-alpha comes from the opacity slider. It tints the panel
+     background only, never the element itself: applying `opacity` to the
+     whole overlay would fade the text along with it and make a translucent
+     window unreadable. This way the glass gets more transparent while the
+     conversation stays crisp. */
+  --panel: rgba(18, 18, 22, var(--overlay-alpha, 0.55));
+  --hairline: rgba(255, 255, 255, 0.12);
+  --text: #f4f4f5;
+  --muted: rgba(255, 255, 255, 0.6);
+  --accent: #6aa8ff;
+
+  width: 100vw;
+  height: 100vh;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  border-radius: 14px;
+  background-color: var(--panel);
+  /* Deliberately NO backdrop-filter. On a transparent Tauri window under
+     WebView2 there is no backdrop to sample, and the compositor falls back to
+     painting an opaque layer — which defeats window transparency entirely and
+     is exactly why this overlay rendered as a solid dark rectangle. The
+     translucency here comes from the alpha channel of --panel alone.
+
+     Text stays readable against a busy desktop via the shadow below rather
+     than by making the background more opaque. */
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
+  color: var(--text);
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ---------- header: the drag area ---------- */
+
+/* The whole bar is the drag handle (via data-tauri-drag-region in the TSX),
+   so there is no separate grip glyph to spend space on. Buttons inside opt
+   out simply by being interactive elements Tauri ignores for dragging. */
+.overlay-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline);
+  flex: 0 0 auto;
+  cursor: grab;
+}
+
+.overlay-header:active {
+  cursor: grabbing;
+}
+
+@keyframes overlay-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.audio-level-bars {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+/* A liveness cue, not a volume meter — always bounces at the same fast, high
+   amplitude while listening, staggered per bar via animation-delay so the
+   three don't move in lockstep (which reads as one blinking block rather
+   than an active equalizer). */
+.audio-level-bar {
+  width: 3px;
+  height: 3px;
+  border-radius: 1px;
+  background: #4ade80;
+  animation: audio-bar-bounce 0.5s ease-in-out infinite;
+}
+
+.audio-level-bar:nth-child(1) { animation-delay: 0s; }
+.audio-level-bar:nth-child(2) { animation-delay: 0.15s; }
+.audio-level-bar:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes audio-bar-bounce {
+  0%, 100% { height: 3px; }
+  50% { height: 14px; }
+}
+
+.overlay-title {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.overlay-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+/* Opacity bar. Deliberately narrow — it shares the header with four buttons,
+   and 64px is still a comfortable drag target for a coarse setting. */
+.overlay-opacity-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 64px;
+  height: 14px;
+  margin: 0 6px 0 0;
+  background: transparent;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.overlay-opacity-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.overlay-opacity-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text);
+  /* Centers the thumb on the 3px track. */
+  margin-top: -3.5px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.overlay-opacity-slider:hover::-webkit-slider-thumb {
+  background: #fff;
+}
+
+.overlay-opacity-slider:focus {
+  outline: none;
+}
+
+.overlay-opacity-slider:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 2px rgba(106, 168, 255, 0.7);
+}
+
+/* Small pill toggle for Auto AI — sits left of the opacity slider. Kept
+   compact and text-labelled (not an icon) since "on/off" needs to read
+   unambiguously at a glance in a live interview, not be inferred from a
+   symbol. */
+.overlay-auto-ai-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  margin-right: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.overlay-auto-ai-toggle:hover {
+  border-color: rgba(255, 255, 255, 0.32);
+  color: var(--text);
+}
+
+/* Meeting Mode's overlay renders this button for visual parity with
+   Interview Mode's, but permanently disabled — it has no auto-send
+   behavior to toggle there (see MeetingOverlay.tsx). Kept visibly inert
+   rather than looking identical-but-broken to the working toggle. */
+.overlay-auto-ai-toggle:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.overlay-auto-ai-toggle:disabled:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  color: var(--muted);
+}
+
+.overlay-auto-ai-toggle .overlay-auto-ai-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+
+.overlay-auto-ai-toggle.on {
+  border-color: rgba(74, 222, 128, 0.55);
+  background: rgba(74, 222, 128, 0.12);
+  color: #d1fae5;
+}
+
+.overlay-auto-ai-toggle.on .overlay-auto-ai-dot {
+  background: #4ade80;
+  box-shadow: 0 0 4px rgba(74, 222, 128, 0.8);
+}
+
+.overlay-icon-button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.overlay-icon-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
+.overlay-icon-button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.overlay-icon-button.close:hover {
+  background: rgba(239, 68, 68, 0.85);
+  color: #fff;
+}
+
+.overlay-voice-command-button.active {
+  background: rgba(239, 68, 68, 0.85);
+  color: #fff;
+}
+
+/* Veronica's Idle -> Listening -> Thinking -> Speaking cycle: the button
+   background follows state (idle keeps the plain "active" red above),
+   and the small dot pulses at a pace/color that reads at a glance without
+   needing to read the header text. */
+.overlay-voice-command-button {
+  position: relative;
+}
+
+.overlay-voice-command-button.veronica-listening {
+  background: rgba(74, 222, 128, 0.85);
+}
+
+.overlay-voice-command-button.veronica-thinking {
+  background: rgba(250, 204, 21, 0.85);
+}
+
+.overlay-voice-command-button.veronica-speaking {
+  background: rgba(96, 165, 250, 0.85);
+}
+
+.veronica-state-dot {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+.veronica-listening .veronica-state-dot {
+  animation: audio-bar-bounce 0.5s ease-in-out infinite;
+}
+
+.veronica-thinking .veronica-state-dot {
+  animation: overlay-pulse 0.8s ease-in-out infinite;
+}
+
+.veronica-speaking .veronica-state-dot {
+  animation: overlay-pulse 0.4s ease-in-out infinite;
+}
+
+.overlay-voice-app-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ---------- close confirmation ---------- */
+
+.overlay-confirm-close {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+
+.overlay-confirm-close-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.overlay-confirm-close-body {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 240px;
+}
+
+.overlay-confirm-close-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.overlay-text-button {
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.overlay-text-button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.overlay-text-button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b1220;
+}
+
+.overlay-text-button.primary:hover {
+  filter: brightness(1.08);
+}
+
+/* ---------- conversation ---------- */
+
+.overlay-chat {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  /* Text in the conversation is the one thing worth selecting/copying, which
+     is why Copy buttons aren't needed. */
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.overlay-chat::-webkit-scrollbar {
+  width: 6px;
+}
+
+.overlay-chat::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+}
+
+.overlay-chat::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overlay-empty {
+  margin: auto 0;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9em;
+}
+
+.chat-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-message {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.chat-role {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.chat-message.interviewer .chat-role {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.chat-message.assistant .chat-role {
+  color: var(--accent);
+}
+
+.chat-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-message.interviewer .chat-text {
+  color: rgba(255, 255, 255, 0.72);
+  border-left: 2px solid rgba(255, 255, 255, 0.14);
+  padding-left: 8px;
+}
+
+.chat-message.assistant .chat-text {
+  color: var(--text);
+}
+
+.chat-message.assistant.failed .chat-text {
+  color: #fca5a5;
+}
+
+.chat-text.muted {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.chat-text.thinking {
+  animation: overlay-pulse 1.4s ease-in-out infinite;
+}
+
+/* Markdown-rendered answers (react-markdown produces real block elements —
+   p/ul/ol/h1-3/strong — so this overrides chat-text's pre-wrap/plain-text
+   defaults with compact spacing that fits the same small chat bubble instead
+   of the browser's default heading/list margins. */
+.chat-markdown {
+  white-space: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.chat-markdown p {
+  margin: 0;
+}
+
+.chat-markdown ul,
+.chat-markdown ol {
+  margin: 0;
+  padding-left: 1.15em;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-markdown li {
+  padding-left: 2px;
+}
+
+.chat-markdown li > p {
+  display: inline;
+}
+
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3 {
+  margin: 2px 0 0;
+  font-size: 1em;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.chat-markdown strong {
+  font-weight: 700;
+  color: var(--text);
+}
+
+.chat-markdown code {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 0.92em;
+}
+
+/* ---------- compose row ---------- */
+
+.overlay-compose {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.overlay-question-input {
+  /* No border, no fill — this is meant to read as open typing space
+     continuing the conversation above it, not a boxed form input sitting in
+     the compose row. A bottom rule is the only separation from the button. */
+  flex: 1 1 auto;
+  /* Height is driven by InterviewOverlay's autoGrow() (measures scrollHeight
+     as the text changes), not by flex — a growing textarea needs an explicit
+     height in pixels to report an accurate scrollHeight on the next keystroke.
+     max-height is a CSS backstop matching MAX_QUESTION_INPUT_PX in the TSX,
+     in case a resize event fires before the JS measurement does. */
+  max-height: 160px;
+  resize: none;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 4px 2px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1.45;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.overlay-question-input:focus {
+  outline: none;
+  border-bottom-color: rgba(106, 168, 255, 0.6);
+}
+
+.overlay-question-input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+/* Same slim scrollbar as .overlay-chat, so a tall dictated question doesn't
+   suddenly show the browser's default wide scrollbar in the middle of the
+   compose row. */
+.overlay-question-input::-webkit-scrollbar {
+  width: 6px;
+}
+
+.overlay-question-input::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+}
+
+.overlay-question-input::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.overlay-ask-button {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: #08131f;
+  font-family: inherit;
+  font-size: 0.85em;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.overlay-ask-button:hover:not(:disabled) {
+  background: #83b8ff;
+}
+
+.overlay-ask-button:disabled {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--muted);
+  cursor: default;
+}
+
+.overlay-error {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 12px 10px;
+  color: #fca5a5;
+  font-size: 0.85em;
+}
+
+/* Deliberately louder than .overlay-error (solid background, not just
+   colored text) — this isn't a transient failure the user can shrug off,
+   it means the window is not actually hidden from screen capture, so it
+   needs to read as a standing condition rather than a passing notice. */
+.overlay-capture-warning {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 12px;
+  background: rgba(251, 191, 36, 0.15);
+  border-bottom: 1px solid rgba(251, 191, 36, 0.35);
+  color: #fbbf24;
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+/* Compact density tightens the conversation, not the chrome. */
+.overlay-root.density-compact .overlay-chat {
+  gap: 10px;
+  padding: 8px 10px;
+}
+
+.overlay-root.density-compact .chat-turn {
+  gap: 6px;
+}
+
+.overlay-settings {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.overlay-settings-section {
+  margin-bottom: 10px;
+}
+
+.overlay-settings-section p {
+  margin: 2px 0;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.overlay-settings-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: rgba(255, 255, 255, 0.5);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.overlay-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+
+.overlay-settings-row > span:first-child {
+  flex: 1;
+  min-width: 0;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.overlay-settings-row input[type="text"] {
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 5px;
+  color: #f2f2f2;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+/* Dark-surface theme for the shared Select component (see .select-* in
+   App.css), used in the overlay's own settings panels which sit on a
+   translucent dark background rather than the main app's light --surface. */
+.overlay-settings-row .select-overlay {
+  flex: 1.4;
+  min-width: 0;
+}
+
+.select-overlay .select-trigger {
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 5px;
+  color: #f2f2f2;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.select-overlay .select-trigger:hover {
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.select-overlay .select-trigger:focus-visible,
+.select-overlay .select-trigger[aria-expanded="true"] {
+  border-color: #5b8def;
+  box-shadow: 0 0 0 2px rgba(91, 141, 239, 0.35);
+}
+
+.select-overlay .select-trigger-caret {
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.select-overlay .select-menu {
+  background: #23262e;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.select-overlay .dropdown-item {
+  color: #f2f2f2;
+  font-size: 12px;
+}
+
+.select-overlay .dropdown-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.select-overlay .dropdown-item.active {
+  background: rgba(91, 141, 239, 0.25);
+  color: #cddcfb;
+}
+
+.overlay-settings-row input[type="range"] {
+  flex: 1.4;
+  accent-color: #5b8def;
+}
+
+.overlay-settings-row input[type="checkbox"] {
+  accent-color: #5b8def;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.overlay-settings-value {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.55);
+  width: 32px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.overlay-settings-checkbox {
+  justify-content: flex-start;
+}
+
+.overlay-settings-checkbox span {
+  flex: initial;
+}
+
+.overlay-settings-column {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.overlay-settings-column input[type="text"],
+.overlay-settings-column textarea {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.overlay-settings-column textarea {
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 5px;
+  color: #f2f2f2;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  resize: none;
+}
+
+.overlay-settings-note {
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.45);
+  margin: 4px 0 0;
+}
+
+.overlay-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* Buttons used by the settings panel's footer (Reset / Done). The chat view
+   itself deliberately has only the icon row and Ask AI. */
+.overlay-button {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.overlay-button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.overlay-button.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #08131f;
+  font-weight: 600;
+}
+
+.overlay-button.primary:hover {
+  background: #83b8ff;
+}
