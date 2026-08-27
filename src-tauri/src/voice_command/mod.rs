@@ -15,12 +15,6 @@
 //! `TranscriptManager` already keys in-progress segments per `AudioSource`
 //! (see transcript/mod.rs), so both sources safely feed the same transcript
 //! concurrently.
-//!
-//! Also hosts `launch_app`: the one system-level action available from the
-//! overlay's Voice Commands settings (spawning an allowlisted program the
-//! user configured ahead of time — see OverlaySettingsPanel.tsx). Kept here
-//! since it shares this module's "voice-triggered action" scope, though it
-//! runs independent of whether mic mode is on.
 
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -118,19 +112,4 @@ pub fn stop_mic_assistant(session: State<'_, MicAssistantSession>) -> Result<(),
         let _ = handle.join();
     }
     Ok(())
-}
-
-/// One allowlisted app entry, defined by the user in Settings — `path` is
-/// whatever they typed there (an exe name resolvable on PATH, or a full
-/// path), never text derived from speech.
-#[tauri::command]
-pub fn launch_app(path: String) -> Result<(), String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        return Err("no path configured for this app".into());
-    }
-    std::process::Command::new(trimmed)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("failed to launch '{trimmed}': {e}"))
 }

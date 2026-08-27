@@ -158,34 +158,29 @@ pub struct ConversationTurn {
     pub answer: String,
 }
 
-/// Every context field here is optional and purely additive — the backend
-/// answers the question with or without any of them (see
-/// `apps/backend/app/services/ask_service.py`). `retrieved_context` being
-/// empty is a completely normal case, not a degraded one.
+/// Every context field here is optional and purely additive — Veronica
+/// answers the question with or without any of them. `retrieved_context`
+/// being empty is a completely normal case, not a degraded one.
 #[derive(Debug, Clone, Serialize)]
 pub struct AskRequest {
     pub question: String,
-    /// Prior turns of the current Interview Mode session, oldest first,
-    /// excluding the question being asked now. Empty for the first question.
+    /// Prior turns of the current conversation, oldest first, excluding the
+    /// question being asked now. Empty for the first question.
     pub conversation_history: Vec<ConversationTurn>,
     pub retrieved_context: Vec<AskRetrievedChunk>,
+    /// Text from any documents the user has attached (see
+    /// `DocumentContext.tsx`) — generic supporting material, not tied to any
+    /// particular kind of document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_context: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_description: Option<String>,
     /// "brief" | "default" | "detailed" — validated backend-side.
     pub answer_length: String,
     /// "natural" | "technical" | "concise" — validated backend-side.
     pub response_style: String,
-    /// "simple" | "professional" | "advanced" — validated backend-side.
-    pub english_level: String,
     /// "natural" | "conversational" | "formal" — validated backend-side.
     pub humanization: String,
     /// "openai" | "anthropic" | "gemini" — the header dropdown's chosen model provider.
-    /// `None` keeps the server-configured LLM_PROVIDER default (see
-    /// apps/backend/app/schemas/ask.py's AskRequest.llm_provider).
+    /// `None` keeps the server-configured LLM_PROVIDER default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_provider: Option<String>,
 }
@@ -227,80 +222,6 @@ pub struct SetupAnalysisResponse {
     pub focus_areas: Vec<String>,
     #[serde(default)]
     pub candidate_highlights: Vec<String>,
-}
-
-/// Wire types for Meeting Mode — matches `apps/backend/app/schemas/meeting.py`.
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingConversationTurn {
-    pub question: String,
-    pub answer: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingRetrievedChunk {
-    pub text: String,
-    pub source_filename: String,
-    pub document_type: String,
-    pub score: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingAskRequest {
-    pub question: String,
-    pub conversation_history: Vec<MeetingConversationTurn>,
-    pub retrieved_context: Vec<MeetingRetrievedChunk>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meeting_title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub participants: Option<String>,
-    pub answer_length: String,
-    pub response_style: String,
-    pub humanization: String,
-    /// "openai" | "anthropic" | "gemini" — the header dropdown's chosen model provider.
-    /// `None` keeps the server-configured LLM_PROVIDER default (see
-    /// apps/backend/app/schemas/meeting.py's MeetingAskRequest.llm_provider).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_provider: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MeetingAskResponse {
-    pub answer: String,
-    pub latency_ms: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingTurnIn {
-    pub speaker: String,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct MeetingSummaryRequest {
-    pub turns: Vec<MeetingTurnIn>,
-    pub key_points: Vec<String>,
-    pub decisions: Vec<String>,
-    pub action_items: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meeting_title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub participants: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-pub struct MeetingSummary {
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub key_points: Vec<String>,
-    #[serde(default)]
-    pub decisions: Vec<String>,
-    #[serde(default)]
-    pub action_items: Vec<String>,
-    #[serde(default)]
-    pub next_steps: Vec<String>,
-    #[serde(default)]
-    pub message: String,
 }
 
 /// Wire types for Notes Mode — matches `apps/backend/app/schemas/notes.py`.

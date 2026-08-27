@@ -29,6 +29,5 @@ pub async fn execute(intent: &Intent) -> Result<String, String> {
         Intent::OpenFolder(target) => native::open_path_or_url(target),
         Intent::OpenUrl(target) => native::open_path_or_url(target),
         Intent::QuerySystemInfo(kind) => native::query_system_info(kind),
-        Intent::Unknown => Ok("I didn't recognize an action in that.".to_string()),
     }
 }

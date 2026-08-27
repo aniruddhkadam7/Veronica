@@ -35,7 +35,7 @@ const COMPACT_WIDTH: f64 = 760.0;
 /// 56px header) — what's actually painted on screen, distinct from the
 /// window's real fixed OS height (720px, tauri.conf.json). `pub` so other
 /// windows that need to dock relative to what the user actually sees (the
-/// interview overlay — see interview_mode/window.rs's dock_below_main_window)
+/// Veronica overlay — see veronica_window.rs's dock_below_main_window)
 /// use this instead of the real (much taller) `outer_size()`.
 pub const COMPACT_HEIGHT: f64 = 88.0;
 

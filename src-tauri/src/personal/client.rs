@@ -8,13 +8,12 @@
 //! `Result<_, String>` shape every call site already returns.
 
 use crate::backend::{
-    AskRequest, AskResponse, InterviewAnalysisRequest, MeetingAskRequest, MeetingAskResponse, MeetingSummary,
-    MeetingSummaryRequest, NoteSummary, NotesAskRequest, NotesAskResponse, NotesSummaryRequest,
-    OverallInterviewAnalysis, QuestionAnalysis, SetupAnalysisRequest, SetupAnalysisResponse,
+    AskRequest, AskResponse, InterviewAnalysisRequest, NoteSummary, NotesAskRequest, NotesAskResponse,
+    NotesSummaryRequest, OverallInterviewAnalysis, QuestionAnalysis, SetupAnalysisRequest, SetupAnalysisResponse,
 };
 
 use super::api_key_store;
-use super::prompts::{analysis, ask, meeting, notes, setup, ChatMessage};
+use super::prompts::{analysis, notes, setup, veronica, ChatMessage};
 use super::provider::LlmProvider;
 use super::providers::{anthropic, gemini, openai};
 
@@ -73,24 +72,12 @@ impl DirectLlmClient {
         }
     }
 
-    // ---- Veronica action intent classification ----
+    // ---- Veronica ask ----
 
-    /// One-shot, non-streaming call for structured/classification-style
-    /// prompts (a `(system_prompt, user_prompt)` pair that demands JSON-only
-    /// output) — used by `crate::actions::run_veronica_action` via
-    /// `personal::prompts::intent`. Low temperature and a small token cap
-    /// since the response is always a tiny fixed-shape JSON object, not
-    /// prose.
-    pub async fn classify(&self, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
-        let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-        self.generate(&messages, 0.1, 200).await
-    }
-
-    // ---- Interview Mode ask ----
-
+    #[allow(dead_code)]
     pub async fn ask(&self, request: &AskRequest) -> Result<AskResponse, String> {
-        let messages = ask::build_messages(request);
-        let max_tokens = ask::max_tokens_for_question(request);
+        let messages = veronica::build_messages(request);
+        let max_tokens = veronica::max_tokens_for_question(request);
         let answer = self.generate(&messages, 0.65, max_tokens).await?;
         Ok(AskResponse { answer: answer.trim().to_string(), latency_ms: 0.0 })
     }
@@ -99,8 +86,8 @@ impl DirectLlmClient {
     where
         F: FnMut(&str),
     {
-        let messages = ask::build_messages(request);
-        let max_tokens = ask::max_tokens_for_question(request);
+        let messages = veronica::build_messages(request);
+        let max_tokens = veronica::max_tokens_for_question(request);
         let mut full_answer = String::new();
         self.stream(&messages, 0.65, max_tokens, |delta| {
             full_answer.push_str(delta);
@@ -186,49 +173,6 @@ impl DirectLlmClient {
                 Err(err) => Ok(analysis::average_score_fallback(question_analyses, session_id, &err)),
             },
             Err(err) => Ok(analysis::average_score_fallback(question_analyses, session_id, &err)),
-        }
-    }
-
-    // ---- Meeting Mode ----
-
-    pub async fn meeting_ask_stream<F>(&self, request: &MeetingAskRequest, mut on_delta: F) -> Result<String, String>
-    where
-        F: FnMut(&str),
-    {
-        let messages = meeting::build_ask_messages(request);
-        let max_tokens = meeting::max_tokens(request);
-        let mut full_answer = String::new();
-        self.stream(&messages, 0.65, max_tokens, |delta| {
-            full_answer.push_str(delta);
-            on_delta(delta);
-        })
-        .await?;
-        Ok(full_answer)
-    }
-
-    #[allow(dead_code)]
-    pub async fn meeting_ask(&self, request: &MeetingAskRequest) -> Result<MeetingAskResponse, String> {
-        let messages = meeting::build_ask_messages(request);
-        let max_tokens = meeting::max_tokens(request);
-        let answer = self.generate(&messages, 0.65, max_tokens).await?;
-        Ok(MeetingAskResponse { answer: answer.trim().to_string(), latency_ms: 0.0 })
-    }
-
-    pub async fn meeting_summarize(&self, request: &MeetingSummaryRequest) -> Result<MeetingSummary, String> {
-        if request.turns.is_empty() {
-            return Ok(meeting::empty_turns_summary());
-        }
-
-        let (system_prompt, user_prompt) = meeting::build_summary_prompt(request);
-        let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(user_prompt)];
-
-        const MAX_OUTPUT_TOKENS: u32 = 1500;
-        match self.generate(&messages, 0.2, MAX_OUTPUT_TOKENS).await {
-            Ok(raw) => match meeting::parse_summary(&raw) {
-                Ok(summary) => Ok(summary),
-                Err(err) => Ok(meeting::tracked_items_fallback(request, &err)),
-            },
-            Err(err) => Ok(meeting::tracked_items_fallback(request, &err)),
         }
     }
 

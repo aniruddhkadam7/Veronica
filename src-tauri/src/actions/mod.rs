@@ -1,43 +1,27 @@
-//! Veronica's action-taking system: a spoken request (already recognized as
-//! an action by the overlay's wake-phrase check — see InterviewOverlay.tsx's
-//! `tryVeronicaAction`) is classified into a fixed intent vocabulary by the
-//! existing LLM, checked against a hardcoded safety table, and — only for
-//! the safe set — executed via the fastest available native mechanism.
-//!
-//! Pipeline: Query Understanding (personal::prompts::intent) -> Intent ->
-//! Safety Check (registry::risk_level) -> Fastest-Method Router
-//! (router::execute) -> Execute (native).
+//! Veronica's action-taking system: `veronica::ask_veronica` recognizes when
+//! the model's response is an `ACTION: <NAME> | <target>` directive (see
+//! `personal::prompts::veronica`'s ACTION-TAKING section) instead of a
+//! normal answer, parses it into an `Intent` via `parse_action_line`, and
+//! calls `execute` here — checked against a hardcoded safety table first.
 //!
 //! The LLM never executes anything itself — it only ever returns one of six
-//! fixed intent names (personal/prompts/intent.rs's schema has no slot for
-//! an arbitrary command), and this module's `Intent` enum has no variant
-//! that could represent a destructive action (delete, format, registry/
-//! security change, credential access, shutdown, arbitrary shell execution,
-//! bulk destructive ops, or a consequential external send) — so there is no
-//! code path, not even a guarded one, that could run any of those from a
-//! voice command. Anything the classifier can't confidently map to the safe
-//! six comes back as `Intent::Unknown`, which is refused before the router
-//! is ever reached.
+//! fixed intent names (the ACTION line format has no slot for an arbitrary
+//! command), and `Intent` has no variant that could represent a destructive
+//! action (delete, format, registry/security change, credential access,
+//! shutdown, arbitrary shell execution, bulk destructive ops, or a
+//! consequential external send) — so there is no code path, not even a
+//! guarded one, that could run any of those from a request to Veronica.
+//! Anything the model doesn't map to the safe six is never wrapped as an
+//! `Intent` at all (see `parse_action_line`) and is treated as a normal
+//! answer instead.
 
 mod native;
 mod registry;
 mod router;
 
-use tauri::AppHandle;
-
-use crate::personal::prompts::intent::{self, ParsedIntent};
-use crate::personal::DirectLlmClient;
-
 pub use registry::RiskLevel;
 
-/// The ONLY vocabulary the router/executor ever see. Mirrors
-/// `personal::prompts::intent::ParsedIntent` one-to-one — kept as a
-/// separate type (rather than reusing `ParsedIntent` directly in the
-/// router) so the prompt-parsing module and the execution module don't need
-/// to depend on each other's internals, but the shape is deliberately
-/// identical: adding a new action means adding a variant to BOTH, which
-/// keeps `registry::risk_level` and `intent::parse_intent` from silently
-/// drifting apart on what's representable at all.
+/// The ONLY vocabulary the router/executor ever see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     OpenApp(String),
@@ -45,47 +29,65 @@ pub enum Intent {
     OpenFolder(String),
     OpenUrl(String),
     QuerySystemInfo(String),
-    Unknown,
 }
 
-impl From<ParsedIntent> for Intent {
-    fn from(parsed: ParsedIntent) -> Self {
-        match parsed {
-            ParsedIntent::OpenApp(t) => Intent::OpenApp(t),
-            ParsedIntent::OpenFile(t) => Intent::OpenFile(t),
-            ParsedIntent::OpenFolder(t) => Intent::OpenFolder(t),
-            ParsedIntent::OpenUrl(t) => Intent::OpenUrl(t),
-            ParsedIntent::QuerySystemInfo(t) => Intent::QuerySystemInfo(t),
-            ParsedIntent::Unknown => Intent::Unknown,
-        }
+/// Parses one line of the shape `ACTION: <NAME> | <target>` (the model's
+/// entire response, when it's taking an action — see
+/// `personal::prompts::veronica::SYSTEM_PROMPT`'s ACTION-TAKING section)
+/// into an `Intent`. Returns `None` for anything that doesn't match this
+/// exact shape or whose `<NAME>` isn't one of the six recognized values —
+/// both cases mean "not an action," handled by the caller as a normal
+/// answer, never as a partially-understood command.
+pub fn parse_action_line(line: &str) -> Option<Intent> {
+    let rest = line.trim().strip_prefix("ACTION:")?;
+    let (name, target) = rest.split_once('|')?;
+    let name = name.trim();
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    match name {
+        "OPEN_APP" => Some(Intent::OpenApp(target.to_string())),
+        "OPEN_FILE" => Some(Intent::OpenFile(target.to_string())),
+        "OPEN_FOLDER" => Some(Intent::OpenFolder(target.to_string())),
+        "OPEN_URL" => Some(Intent::OpenUrl(target.to_string())),
+        "QUERY_SYSTEM_INFO" => Some(Intent::QuerySystemInfo(target.to_string())),
+        _ => None,
     }
 }
 
-/// The one command the overlay calls for a recognized "Veronica, ..." voice
-/// action. `utterance` is the text AFTER the wake phrase has already been
-/// stripped client-side. Never fails outright for "didn't understand" or
-/// "not allowed" cases — those come back as `Ok(refusal message)`, the same
-/// way a normal Ask AI answer would, so the overlay can render them as a
-/// plain turn. `Err` is reserved for real failures (no API key configured,
-/// provider request failed) — the overlay's existing error handling already
-/// knows how to surface those.
-#[tauri::command]
-pub async fn run_veronica_action(_app: AppHandle, utterance: String) -> Result<String, String> {
-    let trimmed = utterance.trim();
-    if trimmed.is_empty() {
-        return Ok("I didn't catch an action in that.".to_string());
-    }
-
-    let (system_prompt, user_prompt) = intent::build_intent_prompt(trimmed);
-    let raw = DirectLlmClient::new(None)?.classify(&system_prompt, &user_prompt).await?;
-    let intent: Intent = intent::parse_intent(&raw).into();
-
-    if matches!(intent, Intent::Unknown) {
-        return Ok("I didn't recognize an action in that.".to_string());
-    }
-
+/// Checks the safety registry, then runs the action through the fastest-
+/// method router. Called by `veronica::ask_veronica` once it's recognized
+/// and parsed an `ACTION:` line.
+pub async fn execute(intent: Intent) -> String {
     match registry::risk_level(&intent) {
-        RiskLevel::Blocked => Ok(registry::refusal_message(&intent)),
-        RiskLevel::Safe => router::execute(&intent).await,
+        RiskLevel::Blocked => registry::refusal_message(&intent),
+        RiskLevel::Safe => router::execute(&intent).await.unwrap_or_else(|e| e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_action_line() {
+        assert_eq!(parse_action_line("ACTION: OPEN_APP | Notepad"), Some(Intent::OpenApp("Notepad".to_string())));
+    }
+
+    #[test]
+    fn rejects_non_action_text() {
+        assert_eq!(parse_action_line("Sure, here's how RAG works..."), None);
+    }
+
+    #[test]
+    fn rejects_unknown_action_name() {
+        assert_eq!(parse_action_line("ACTION: DELETE_FILE | C:\\important.txt"), None);
+    }
+
+    #[test]
+    fn rejects_empty_target() {
+        assert_eq!(parse_action_line("ACTION: OPEN_APP | "), None);
     }
 }

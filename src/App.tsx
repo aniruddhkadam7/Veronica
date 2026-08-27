@@ -14,7 +14,6 @@ import { Account } from "./Account";
 import { SettingsPopover } from "./SettingsPopover";
 import { LowEndHardwareBanner } from "./LowEndHardwareBanner";
 import { HeaderDropdown } from "./HeaderDropdown";
-import { answerStyleToOverlayFields, loadOverlaySettings, saveOverlaySettings } from "./overlaySettings";
 import { Button, Spinner } from "./ui";
 import {
   IconAccount,
@@ -27,18 +26,12 @@ import {
   IconSettings,
 } from "./Icons";
 import { IconAnthropic, IconDeepSeek, IconGemini, IconOpenAI } from "./ProviderIcons";
-import { INTERVIEW_CONTEXT_SECTIONS, MEETING_CONTEXT_SECTIONS } from "./headerPopups";
+import { VERONICA_CONTEXT_SECTIONS } from "./headerPopups";
 import { hasStoredLlmProvider, loadLlmProvider, saveLlmProvider, type LlmProvider } from "./llmProviderSetting";
 import { getPersonalApiKey } from "./personalApiKeys";
 
-export type Mode = "INTERVIEW" | "MEETING";
 type SessionState = "IDLE" | "STARTING" | "LISTENING";
-type Popover = "MODE" | "MODEL" | "CONTEXT" | "SETTINGS" | "ACCOUNT" | null;
-
-const MODE_LABELS: Record<Mode, string> = {
-  INTERVIEW: "Interview",
-  MEETING: "Meeting",
-};
+type Popover = "MODEL" | "CONTEXT" | "SETTINGS" | "ACCOUNT" | null;
 
 // Only "openai", "anthropic", and "gemini" have a real backend
 // implementation (see apps/backend/app/services/llm/__init__.py::
@@ -52,7 +45,6 @@ const LLM_PROVIDERS: { value: LlmProvider; label: string; icon: typeof IconOpenA
 ];
 
 function App() {
-  const [mode, setMode] = useState<Mode>("INTERVIEW");
   const [llmProvider, setLlmProvider] = useState<LlmProvider>(() => loadLlmProvider());
 
   // First launch (no provider explicitly chosen yet): auto-select whichever
@@ -82,25 +74,23 @@ function App() {
   const [openPopover, setOpenPopover] = useState<Popover>(null);
   const [error, setError] = useState<string | null>(null);
   const [isMaximized, setIsMaximized] = useState(false);
-  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
 
-  const [interviewContext, setInterviewContext] = useState<DocumentContextState>(() =>
-    emptyDocumentContextState(INTERVIEW_CONTEXT_SECTIONS),
+  const [documentContext, setDocumentContext] = useState<DocumentContextState>(() =>
+    emptyDocumentContextState(VERONICA_CONTEXT_SECTIONS),
   );
-  const [meetingContext, setMeetingContext] = useState<DocumentContextState>(() =>
-    emptyDocumentContextState(MEETING_CONTEXT_SECTIONS),
-  );
-  const [meetingTitle, setMeetingTitle] = useState("");
-  const [meetingParticipants, setMeetingParticipants] = useState("");
 
-  // Prewarm STT the moment the app launches — the mic model loads while the
-  // user is still picking a mode/attaching context, so Start doesn't eat the
-  // full load time.
+  // Prewarm the STT sidecar the moment the app launches — the model loads
+  // while the user is still attaching context, so Start doesn't eat the
+  // full load time. Uses a throwaway mic-assistant start/stop cycle purely
+  // to force the STT model to load early; actual listening only begins
+  // when the user presses Start (see handleStart), not here.
   const prewarmRef = useRef<Promise<void> | null>(null);
   useEffect(() => {
-    const promise = invoke<void>("start_system_audio_capture").catch((e) => {
-      if (String(e) !== "capture already running") throw e;
-    });
+    const promise = invoke<void>("start_mic_assistant")
+      .then(() => invoke<void>("stop_mic_assistant").catch(() => {}))
+      .catch((e) => {
+        if (String(e) !== "mic assistant already running") throw e;
+      });
     prewarmRef.current = promise;
     promise.catch(() => {});
   }, []);
@@ -132,17 +122,16 @@ function App() {
     document.body.classList.toggle("compact-transparent", !isMaximized);
   }, [isMaximized]);
 
-  // The overlay window (Interview/Meeting) and this main window are separate
-  // webviews with no shared React state — ending a session from inside the
-  // overlay (its own ✕ / "Yes, end interview" / Escape) has no way to reset
-  // this window's Start/Stop button back to idle on its own. The Rust side
-  // emits this event whenever an overlay closes, from whichever side
-  // triggered it, so this listener is what keeps the two in sync instead of
-  // requiring a redundant click on Stop here after already ending it there.
+  // The overlay window and this main window are separate webviews with no
+  // shared React state — ending a session from inside the overlay (its own
+  // ✕ / Escape) has no way to reset this window's Start/Stop button back to
+  // idle on its own. The Rust side emits this event whenever the overlay
+  // closes, from whichever side triggered it, so this listener is what
+  // keeps the two in sync instead of requiring a redundant click on Stop
+  // here after already ending it there.
   useEffect(() => {
     const unlisten = listen("interview-mode:overlay-closed", () => {
       setSessionState("IDLE");
-      setHistoryRefreshKey((k) => k + 1);
     });
     return () => {
       unlisten.then((f) => f());
@@ -159,72 +148,45 @@ function App() {
 
   const closePopover = useCallback(() => setOpenPopover(null), []);
 
-  const startInterview = useCallback(async () => {
-    const overlaySettings = loadOverlaySettings();
-    saveOverlaySettings({ ...overlaySettings, ...answerStyleToOverlayFields(overlaySettings.answerStyle) });
-
-    uploadDocumentContext(INTERVIEW_CONTEXT_SECTIONS, interviewContext);
-
-    // Opt-in, signed-in-only: resolves to { rejection: null } when the user
-    // isn't signed in, or when something unrelated to entitlement went wrong
-    // (credential-store hiccup, network blip reaching the backend) — local
-    // recording has no dependency on this feature and must never be blocked
-    // by it. Only a genuine backend entitlement rejection (no remaining
-    // minutes, concurrent session limit, etc.) sets `rejection`, which we
-    // propagate so Start actually stops — see start_backend_session's
-    // Rust-side doc (BackendSessionResult) for the full contract.
-    const sessionResult = await invoke<{ rejection: string | null }>("start_backend_session", {
-      sttMode: "local",
-    });
-    if (sessionResult.rejection) {
-      throw new Error(sessionResult.rejection);
-    }
-
-    await (prewarmRef.current ??
-      invoke("start_system_audio_capture").catch((e) => {
-        if (String(e) !== "capture already running") throw e;
-      }));
-    await invoke("clear_transcript").catch(() => {});
-    // Veronica has one overlay window for both modes now — set_mode tells
-    // it (and ask_veronica) which behavior to use before it's shown; see
-    // veronica::set_mode and InterviewOverlay.tsx's `mode` state.
-    await invoke("set_mode", { mode: "INTERVIEW" }).catch(() => {});
-    await invoke("show_interview_overlay");
-  }, [interviewContext]);
-
-  const startMeeting = useCallback(async () => {
-    window.localStorage.setItem(
-      "meeting-mode:active-meeting",
-      JSON.stringify({ meetingTitle: meetingTitle.trim(), participants: meetingParticipants.trim() }),
-    );
-
-    uploadDocumentContext(MEETING_CONTEXT_SECTIONS, meetingContext);
-
-    await invoke("clear_meeting_session").catch(() => {});
-    await (prewarmRef.current ??
-      invoke("start_system_audio_capture").catch((e) => {
-        if (String(e) !== "capture already running") throw e;
-      }));
-    await invoke("set_mode", { mode: "MEETING" }).catch(() => {});
-    await invoke("show_interview_overlay");
-  }, [meetingContext, meetingTitle, meetingParticipants]);
-
   const handleStart = useCallback(async () => {
     setError(null);
     setSessionState("STARTING");
     closePopover();
     try {
-      if (mode === "INTERVIEW") {
-        await startInterview();
-      } else {
-        await startMeeting();
+      uploadDocumentContext(VERONICA_CONTEXT_SECTIONS, documentContext);
+
+      // Opt-in, signed-in-only: resolves to { rejection: null } when the
+      // user isn't signed in, or when something unrelated to entitlement
+      // went wrong (credential-store hiccup, network blip reaching the
+      // backend) — local recording has no dependency on this feature and
+      // must never be blocked by it. Only a genuine backend entitlement
+      // rejection (no remaining minutes, concurrent session limit, etc.)
+      // sets `rejection`, which we propagate so Start actually stops — see
+      // start_backend_session's Rust-side doc (BackendSessionResult) for
+      // the full contract.
+      const sessionResult = await invoke<{ rejection: string | null }>("start_backend_session", {
+        sttMode: "local",
+      });
+      if (sessionResult.rejection) {
+        throw new Error(sessionResult.rejection);
       }
+
+      // Wait for the prewarm cycle (start+stop, purely to force the STT
+      // model to load early) to finish before actually starting to listen,
+      // so this doesn't race the prewarm's own start_mic_assistant/
+      // stop_mic_assistant calls.
+      await (prewarmRef.current ?? Promise.resolve());
+      await invoke("clear_transcript").catch(() => {});
+      await invoke("start_mic_assistant").catch((e) => {
+        if (String(e) !== "mic assistant already running") throw e;
+      });
+      await invoke("show_interview_overlay");
       setSessionState("LISTENING");
     } catch (e) {
       setError(String(e));
       setSessionState("IDLE");
     }
-  }, [mode, startInterview, startMeeting, closePopover]);
+  }, [documentContext, closePopover]);
 
   const handleStop = useCallback(async () => {
     try {
@@ -233,17 +195,20 @@ function App() {
       setError(String(e));
     } finally {
       setSessionState("IDLE");
-      setHistoryRefreshKey((k) => k + 1);
-      if (mode === "INTERVIEW") {
-        // Fire-and-forget: finalizes the backend session (if one was
-        // started) so its minutes get decremented. Never blocks Stop and
-        // never surfaces an error to the user — a network blip here must
-        // not cost the user the interview they just finished. No-ops
-        // silently when the user isn't signed in (see start_backend_session).
-        invoke("end_backend_session").catch(() => {});
-      }
+      // Mic assistant is always-on for the whole session now (started by
+      // handleStart, no button in the overlay to stop it) — stop it here
+      // too, not just from the overlay's own close button, since Stop can
+      // end the session from this window without the overlay's closeOverlay
+      // ever running.
+      invoke("stop_mic_assistant").catch(() => {});
+      // Fire-and-forget: finalizes the backend session (if one was started)
+      // so its minutes get decremented. Never blocks Stop and never
+      // surfaces an error to the user — a network blip here must not cost
+      // the user the conversation they just finished. No-ops silently when
+      // the user isn't signed in (see start_backend_session).
+      invoke("end_backend_session").catch(() => {});
     }
-  }, [mode]);
+  }, []);
 
   const startLabel =
     sessionState === "STARTING" ? "Starting…" : sessionState === "LISTENING" ? "Listening" : "Start";
@@ -286,39 +251,6 @@ function App() {
         </div>
 
         <div className="compact-header-controls">
-          <div className="dropdown-anchor">
-            <button
-              className="compact-header-btn"
-              onClick={() => togglePopover("MODE")}
-              disabled={sessionState !== "IDLE"}
-              aria-haspopup="menu"
-              aria-expanded={openPopover === "MODE"}
-            >
-              <span>Mode: {MODE_LABELS[mode]}</span>
-              <IconChevronDown />
-            </button>
-            {openPopover === "MODE" && (
-              <HeaderDropdown onClose={closePopover} className="header-dropdown-menu header-dropdown-mode">
-                <div role="menu">
-                  {(["INTERVIEW", "MEETING"] as Mode[]).map((m) => (
-                    <button
-                      key={m}
-                      role="menuitemradio"
-                      aria-checked={mode === m}
-                      className={`dropdown-item${mode === m ? " active" : ""}`}
-                      onClick={() => {
-                        setMode(m);
-                        closePopover();
-                      }}
-                    >
-                      {MODE_LABELS[m]}
-                    </button>
-                  ))}
-                </div>
-              </HeaderDropdown>
-            )}
-          </div>
-
           <div className="dropdown-anchor">
             <button
               className="compact-header-btn"
@@ -390,34 +322,10 @@ function App() {
                       </button>
                     </div>
                     <div className="popover-body">
-                      {mode === "MEETING" && (
-                        <div className="setup-identity">
-                          <div className="setup-identity-field">
-                            <label htmlFor="meeting-title">Meeting Title</label>
-                            <input
-                              id="meeting-title"
-                              className="setup-input"
-                              value={meetingTitle}
-                              onChange={(e) => setMeetingTitle(e.target.value)}
-                              placeholder="e.g. Q3 Roadmap Review"
-                            />
-                          </div>
-                          <div className="setup-identity-field">
-                            <label htmlFor="meeting-participants">Participants</label>
-                            <input
-                              id="meeting-participants"
-                              className="setup-input"
-                              value={meetingParticipants}
-                              onChange={(e) => setMeetingParticipants(e.target.value)}
-                              placeholder="e.g. Alex, Priya, Sam"
-                            />
-                          </div>
-                        </div>
-                      )}
                       <DocumentContext
-                        sections={mode === "INTERVIEW" ? INTERVIEW_CONTEXT_SECTIONS : MEETING_CONTEXT_SECTIONS}
-                        state={mode === "INTERVIEW" ? interviewContext : meetingContext}
-                        onChange={mode === "INTERVIEW" ? setInterviewContext : setMeetingContext}
+                        sections={VERONICA_CONTEXT_SECTIONS}
+                        state={documentContext}
+                        onChange={setDocumentContext}
                       />
                     </div>
                   </div>
@@ -463,8 +371,6 @@ function App() {
               <HeaderDropdown onClose={closePopover} className="header-dropdown-panel header-dropdown-settings">
                 <SettingsPopover
                   onClose={closePopover}
-                  mode={mode}
-                  historyRefreshKey={historyRefreshKey}
                   onApiKeySaved={(provider) => {
                     setLlmProvider(provider);
                     saveLlmProvider(provider);

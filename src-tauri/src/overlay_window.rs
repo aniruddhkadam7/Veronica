@@ -1,12 +1,10 @@
 //! Shared frameless/always-on-top overlay window mechanics, parameterized by
-//! window label — used by both Interview Mode (via `interview_mode::window`,
-//! which now just calls through to this module with its own label/title
-//! baked in) and Meeting Mode (`meeting_mode::commands`, directly). Used to
-//! be two near-identical copies of this logic, one hardcoded to Interview
-//! Mode's label and one generic; they had quietly diverged (only the
-//! Interview copy got fixed when the overlay's positioning turned out to be
-//! unreliable), which is exactly the kind of drift keeping one shared
-//! implementation avoids.
+//! window label — used by `veronica_window`, which calls through to this
+//! module with Veronica's label/title baked in. Kept parameterized rather
+//! than hardcoded to one label since this module previously served two
+//! separate overlay windows (Interview/Meeting Mode, since merged into one
+//! Veronica overlay) and diverging duplicates of this logic had quietly
+//! drifted apart before that merge.
 
 use tauri::{
     window::Color, AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindow,

@@ -10,10 +10,7 @@ mod commands;
 // verification steps (Milestone 4a) can reference `PerformanceConfig`
 // without a re-export chain.
 pub mod hardware;
-mod history;
-mod interview_mode;
 mod main_window;
-mod meeting_mode;
 mod notes_mode;
 mod overlay_window;
 mod personal;
@@ -22,6 +19,7 @@ mod rag;
 mod state;
 mod tls_init;
 mod veronica;
+mod veronica_window;
 mod voice_command;
 // Public alongside `audio` so `src/bin/pipeline_test.rs` can drive the real
 // recording pipeline headlessly instead of a reimplementation of it.
@@ -48,7 +46,7 @@ pub fn run() {
         // front instead.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             let focus_target = app
-                .get_webview_window(interview_mode::OVERLAY_WINDOW_LABEL)
+                .get_webview_window(veronica_window::OVERLAY_WINDOW_LABEL)
                 .filter(|w| w.is_visible().unwrap_or(false))
                 .or_else(|| app.get_webview_window(main_window::MAIN_WINDOW_LABEL));
             if let Some(window) = focus_target {
@@ -83,15 +81,13 @@ pub fn run() {
                         let _ = app.emit("veronica:toggle-shortcut", ());
                         return;
                     }
-                    if let Err(err) = interview_mode::toggle_overlay_window(app) {
-                        log::warn!("failed to toggle Interview Mode overlay via hotkey: {err}");
+                    if let Err(err) = veronica_window::toggle_overlay_window_sync(app) {
+                        log::warn!("failed to toggle Veronica overlay via hotkey: {err}");
                     }
                 })
                 .build(),
         )
         .manage(AppState::default())
-        .manage(history::HistoryStore::default())
-        .manage(meeting_mode::history::MeetingHistoryStore::default())
         .manage(hardware::stt_rag_coordination::SttRagCoordination::default())
         .manage(voice_command::MicAssistantSession::default())
         .setup(|app| {
@@ -174,27 +170,15 @@ pub fn run() {
             commands::clear_knowledge_base,
             commands::knowledge_base_status,
             commands::search_knowledge_base,
-            interview_mode::commands::show_interview_overlay,
-            interview_mode::commands::hide_interview_overlay,
-            interview_mode::commands::toggle_interview_overlay,
-            interview_mode::commands::set_overlay_always_on_top,
-            interview_mode::commands::resize_interview_overlay,
-            interview_mode::commands::start_backend_session,
-            interview_mode::commands::end_backend_session,
+            veronica_window::show_interview_overlay,
+            veronica_window::hide_interview_overlay,
+            veronica_window::toggle_interview_overlay,
+            veronica_window::set_overlay_always_on_top,
+            veronica_window::resize_interview_overlay,
+            veronica_window::start_backend_session,
+            veronica_window::end_backend_session,
             veronica::ask_veronica,
-            veronica::set_mode,
-            veronica::get_mode,
-            actions::run_veronica_action,
             hardware::commands::get_stt_mode_info,
-            history::list_interview_history,
-            history::archive_interview_session,
-            history::delete_interview_history_entry,
-            meeting_mode::commands::track_meeting_item,
-            meeting_mode::commands::clear_meeting_session,
-            meeting_mode::commands::end_meeting,
-            meeting_mode::history::list_meeting_history,
-            meeting_mode::history::archive_meeting,
-            meeting_mode::history::delete_meeting_history_entry,
             notes_mode::store::list_notes,
             notes_mode::store::get_note,
             notes_mode::store::create_note,
@@ -214,7 +198,6 @@ pub fn run() {
             personal::commands::personal_clear_api_key,
             voice_command::start_mic_assistant,
             voice_command::stop_mic_assistant,
-            voice_command::launch_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -8,20 +8,12 @@ import {
 } from "./overlaySettings";
 import { Select } from "./ui";
 
-/// Personalization settings: how AI-generated answers should read (tone,
-/// length, humanization), shared by Interview and Meeting Mode. Lives in
-/// OverlaySettings/localStorage — the same store Veronica's one overlay
-/// Settings panel (OverlaySettingsPanel) reads and writes — so a change made
-/// here from the main window's Settings applies to the very next question
-/// asked, in whichever mode is running, without a separate personalization
+/// Personalization settings: how Veronica's answers should read (tone,
+/// length, humanization). Lives in OverlaySettings/localStorage — the same
+/// store the overlay's own Settings panel (OverlaySettingsPanel) reads and
+/// writes — so a change made here from the main window's Settings applies
+/// to the very next question asked, without a separate personalization
 /// store to keep in sync.
-///
-/// englishLevel is intentionally left out — it has no Meeting Mode analogue
-/// server-side (apps/backend/app/schemas/meeting.py has no such field), so
-/// it stays Interview-only rather than showing here as a control that does
-/// nothing in one of the two modes this panel covers. humanization DOES now
-/// apply to both (see prompt_builder_meeting.py's _HUMANIZATION_INSTRUCTIONS
-/// and meeting_mode/commands.rs's MeetingAskOptions).
 export function PersonalizationPanel() {
   const [settings, setSettings] = useState(() => loadOverlaySettings());
 

@@ -1,9 +1,7 @@
-pub mod ask;
 pub mod analysis;
-pub mod intent;
-pub mod meeting;
 pub mod notes;
 pub mod setup;
+pub mod veronica;
 
 /// One chat message, mirroring `apps/backend/app/services/llm/base.py`'s
 /// `LLMMessage` — role is "system" | "user" | "assistant" throughout this

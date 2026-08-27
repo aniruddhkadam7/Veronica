@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window and every overlay window (Interview Mode, Meeting Mode). Tauri 2 scopes IPC/permissions per window label, so any window missing from this list silently loses every command invoke and window action (drag, etc.) even though the window itself still renders.",
-  "windows": ["main", "interview-overlay", "meeting-overlay"],
+  "description": "Capability for the main window and Veronica's overlay window. Tauri 2 scopes IPC/permissions per window label, so any window missing from this list silently loses every command invoke and window action (drag, etc.) even though the window itself still renders.",
+  "windows": ["main", "veronica-overlay"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

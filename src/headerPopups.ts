@@ -1,13 +1,10 @@
 import type { DocumentContextSection } from "./DocumentContext";
 
-export const INTERVIEW_CONTEXT_SECTIONS: DocumentContextSection[] = [
-  { key: "resume", documentType: "RESUME", label: "Resume / CV" },
-  { key: "job_description", documentType: "JOB_DESCRIPTION", label: "Job Description" },
-  { key: "context", documentType: "INTERVIEW_PREPARATION", label: "Upload documents" },
-];
-
-export const MEETING_CONTEXT_SECTIONS: DocumentContextSection[] = [
-  { key: "agenda", documentType: "PROJECT", label: "Agenda" },
-  { key: "reference", documentType: "COMPANY", label: "Reference material" },
-  { key: "documents", documentType: "OTHER", label: "Meeting documents" },
+/// Context Veronica can draw on when answering — one "About you" document
+/// (still tagged RESUME server-side, since `veronica::fetch_document_full_text`
+/// reads that type unconditionally as full text — see veronica.rs) plus a
+/// general documents catch-all covered by RAG retrieval.
+export const VERONICA_CONTEXT_SECTIONS: DocumentContextSection[] = [
+  { key: "about", documentType: "RESUME", label: "About you" },
+  { key: "documents", documentType: "OTHER", label: "Documents" },
 ];

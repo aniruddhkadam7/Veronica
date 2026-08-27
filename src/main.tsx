@@ -2,18 +2,15 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import App from "./App";
-import { InterviewOverlay } from "./InterviewOverlay";
+import { VeronicaOverlay } from "./VeronicaOverlay";
 import "./tailwind.css";
 import "./overlay.css";
 
 // The overlay window loads the exact same index.html/bundle as the main
 // window (Tauri's WebviewUrl::App points both at "index.html") — which root
 // component renders is decided here by the window's label, set when the
-// overlay is created in Rust. There is only one overlay window/label now —
-// InterviewOverlay is Veronica's one overlay for both Interview and Meeting
-// mode (see its `mode` state) — the label is still "interview-overlay" to
-// minimize Rust-side churn, not because it's Interview-exclusive.
-const FIXED_OVERLAY_LABELS = new Set(["interview-overlay"]);
+// overlay is created in Rust.
+const FIXED_OVERLAY_LABELS = new Set(["veronica-overlay"]);
 
 const label = getCurrentWebviewWindow().label;
 const isOverlay = FIXED_OVERLAY_LABELS.has(label);
@@ -29,7 +26,7 @@ if (isOverlay) {
 }
 
 function Root() {
-  if (label === "interview-overlay") return <InterviewOverlay />;
+  if (label === "veronica-overlay") return <VeronicaOverlay />;
   return <App />;
 }
 

@@ -8,7 +8,6 @@ import {
   type OverlaySettings,
   type OverlaySize,
   type ResponseStyle,
-  type VoiceLaunchApp,
 } from "./overlaySettings";
 import { Select } from "./ui";
 
@@ -19,36 +18,15 @@ interface Props {
   captureExcluded: boolean | null;
 }
 
-/// Interview Mode's Settings panel — everything the overlay needs beyond the
+/// Veronica's Settings panel — everything the overlay needs beyond the
 /// question/answer flow, without becoming the large Record/Prepare
 /// dashboard. Renders inline in the same small overlay window (swapped in for
 /// the question/answer body), not a separate window.
 export function OverlaySettingsPanel({ settings, onChange, onClose, captureExcluded }: Props) {
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
-  const [newAppName, setNewAppName] = useState("");
-  const [newAppPath, setNewAppPath] = useState("");
 
   const set = <K extends keyof OverlaySettings>(key: K, value: OverlaySettings[K]) => {
     onChange({ ...settings, [key]: value });
-  };
-
-  const addVoiceApp = () => {
-    const name = newAppName.trim();
-    const path = newAppPath.trim();
-    if (!name || !path) return;
-    const withoutExisting = settings.voiceLaunchApps.filter(
-      (a) => a.name.toLowerCase() !== name.toLowerCase(),
-    );
-    set("voiceLaunchApps", [...withoutExisting, { name, path }]);
-    setNewAppName("");
-    setNewAppPath("");
-  };
-
-  const removeVoiceApp = (name: string) => {
-    set(
-      "voiceLaunchApps",
-      settings.voiceLaunchApps.filter((a) => a.name !== name),
-    );
   };
 
   const changeSize = (size: OverlaySize) => {
@@ -147,15 +125,6 @@ export function OverlaySettingsPanel({ settings, onChange, onClose, captureExclu
       <div className="overlay-settings-section">
         <span className="overlay-settings-label">Answer</span>
 
-        <label className="overlay-settings-row overlay-settings-checkbox">
-          <input
-            type="checkbox"
-            checked={settings.autoAI}
-            onChange={(e) => set("autoAI", e.target.checked)}
-          />
-          <span>Auto AI — send a question automatically once you stop talking</span>
-        </label>
-
         <div className="overlay-settings-row">
           <span>Answer length</span>
           <Select
@@ -185,26 +154,6 @@ export function OverlaySettingsPanel({ settings, onChange, onClose, captureExclu
             ]}
           />
         </div>
-
-        <label className="overlay-settings-row overlay-settings-column">
-          <span>Role (optional)</span>
-          <input
-            type="text"
-            value={settings.role}
-            onChange={(e) => set("role", e.target.value)}
-            placeholder="e.g. Senior Backend Engineer"
-          />
-        </label>
-
-        <label className="overlay-settings-row overlay-settings-column">
-          <span>Job description (optional)</span>
-          <textarea
-            value={settings.jobDescription}
-            onChange={(e) => set("jobDescription", e.target.value)}
-            placeholder="Paste relevant job description context…"
-            rows={3}
-          />
-        </label>
       </div>
 
       <div className="overlay-settings-section">
@@ -232,55 +181,14 @@ export function OverlaySettingsPanel({ settings, onChange, onClose, captureExclu
       </div>
 
       <div className="overlay-settings-section">
-        <span className="overlay-settings-label">Voice Commands</span>
+        <span className="overlay-settings-label">Talking to Veronica</span>
         <p className="overlay-settings-note">
-          Click the mic button to talk: your voice is transcribed into the question box and
-          asked automatically once you stop talking. Say "open &lt;name&gt;" for an app listed
-          below to launch it instead.
+          Just talk — your voice is transcribed into the question box and asked automatically
+          once you stop talking, no button needed. Use the 🔊 header toggle if you also want
+          Veronica listening to system audio (the other speaker/app sound). Ask it to open an
+          app, file, folder, or URL and it'll just do it — dangerous or destructive requests are
+          always refused.
         </p>
-
-        {settings.voiceLaunchApps.length > 0 && (
-          <ul className="overlay-voice-app-list">
-            {settings.voiceLaunchApps.map((app: VoiceLaunchApp) => (
-              <li key={app.name} className="overlay-settings-row">
-                <span>
-                  "open {app.name}" → {app.path}
-                </span>
-                <button
-                  type="button"
-                  className="overlay-text-button"
-                  onClick={() => removeVoiceApp(app.name)}
-                >
-                  Remove
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-
-        <div className="overlay-settings-row overlay-settings-column">
-          <span>Add an app you can open by voice</span>
-          <input
-            type="text"
-            value={newAppName}
-            onChange={(e) => setNewAppName(e.target.value)}
-            placeholder="Name you'll say, e.g. notepad"
-          />
-          <input
-            type="text"
-            value={newAppPath}
-            onChange={(e) => setNewAppPath(e.target.value)}
-            placeholder="Command to run, e.g. notepad.exe"
-          />
-          <button
-            type="button"
-            className="overlay-button"
-            onClick={addVoiceApp}
-            disabled={!newAppName.trim() || !newAppPath.trim()}
-          >
-            Add app
-          </button>
-        </div>
       </div>
 
       <div className="overlay-settings-section">
