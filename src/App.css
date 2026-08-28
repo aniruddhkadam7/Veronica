@@ -2458,6 +2458,41 @@ body.compact-transparent {
   font-size: 0.82rem;
 }
 
+.personalization-row input[type="range"] {
+  flex: 1;
+  margin: 0 0.5rem;
+}
+
+.widget-color-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  flex-shrink: 0;
+  height: 26px;
+  padding: 0;
+  width: 44px;
+}
+
+.widget-color-input::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.widget-color-input::-webkit-color-swatch {
+  border: none;
+  border-radius: 3px;
+}
+
+.widget-panel-value {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 3.2em;
+  text-align: right;
+}
+
 .prep-field label {
   font-size: 0.8rem;
   font-weight: 600;

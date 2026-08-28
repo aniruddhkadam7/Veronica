@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::process::RagServiceHandle;
@@ -5,6 +6,31 @@ use super::types::{
     DocumentListResponse, DocumentMetadata, DocumentTextResponse, KnowledgeBaseStatus,
     SearchResponse,
 };
+
+/// Built once per process and reused by every `RagClient` — the RAG
+/// service's bearer token is a single per-launch value (see
+/// `RagServiceHandle::auth_token`), so it's safe to bake into a shared
+/// client's default headers rather than rebuilding a client (and its
+/// connection pool) on every `RagClient::new()` call, which previously
+/// happened on nearly every retrieval/document command.
+fn shared_rag_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(value) =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", RagServiceHandle::auth_token()))
+            {
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            }
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(120)) // document processing can be slow
+                .default_headers(headers)
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
 
 pub struct RagClient {
     http: reqwest::Client,
@@ -14,20 +40,7 @@ pub struct RagClient {
 impl RagClient {
     pub fn new() -> Self {
         crate::tls_init::ensure_installed();
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(value) =
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", RagServiceHandle::auth_token()))
-        {
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-        }
-        Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(120)) // document processing can be slow
-                .default_headers(headers)
-                .build()
-                .unwrap_or_default(),
-            base_url: RagServiceHandle::base_url(),
-        }
+        Self { http: shared_rag_http_client(), base_url: RagServiceHandle::base_url() }
     }
 
     pub async fn health_check(&self) -> Result<(), String> {

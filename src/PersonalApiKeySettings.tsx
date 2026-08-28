@@ -33,7 +33,7 @@ const ALL_PROVIDERS: { key: ProviderKey; label: string }[] = [...LLM_PROVIDERS, 
 /// a request stays governed by the existing header dropdown /
 /// llmProviderSetting.ts — this panel only manages keys, not the LLM
 /// selection. Groq/Deepgram have no such selector (each is the only STT/TTS
-/// provider — see src-tauri/src/stt/groq.rs and src-tauri/src/tts/deepgram.rs)
+/// provider — see src-tauri/src/stt/groq.rs and src-tauri/src/tts/deepgram_flux.rs)
 /// so their key is simply configured or not.
 const LLM_PROVIDER_KEYS: readonly PersonalLlmProvider[] = ["openai", "anthropic", "gemini"];
 const isLlmProvider = (key: ProviderKey): key is PersonalLlmProvider =>

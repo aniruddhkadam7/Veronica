@@ -78,6 +78,50 @@ pub enum PipelineStage {
     /// User's question submitted -> final answer complete: the number the
     /// user actually experiences end to end for one "ask" interaction.
     QuestionToAnswer,
+
+    // -- Full per-turn voice-pipeline stages (see `TurnTelemetry`). These are
+    // additive: none of the stages above are removed or renumbered, so any
+    // existing call site keeps working unchanged.
+    /// First audio chunk observed from WASAPI capture this turn.
+    MicDetected,
+    /// Local VAD engine's first `partial` line after a silence/session
+    /// boundary — the moment speech is judged to have started.
+    SpeechStarted,
+    /// Local VAD engine's `final` line — the moment speech is judged to have
+    /// ended (this is the real end-of-utterance signal; nothing downstream
+    /// waits on a fixed timer after this).
+    SpeechEnded,
+    /// The Groq transcription HTTP request for this utterance is dispatched.
+    SttStarted,
+    /// First result available from the STT provider. For Groq (a batch
+    /// endpoint — see `stt::groq`'s module doc) this is always equal to
+    /// `SttFinal`, logged separately anyway so the two are never conflated
+    /// and a future streaming STT provider (see that module's isolated
+    /// interface) has somewhere real to report an earlier value.
+    SttFirstResult,
+    /// The fast router (`actions::fast_router`) begins matching the final
+    /// transcript against the deterministic capability table.
+    RouterStarted,
+    /// The fast router has decided: matched (a capability, executed with no
+    /// LLM call) or fell through to the agent loop.
+    RouterDecision,
+    /// The agent loop's first LLM request for this turn is dispatched
+    /// (distinct from `LlmFirstToken`/`LlmTotal`, which measure one single
+    /// provider call — a multi-step agent turn can dispatch several).
+    LlmStarted,
+    /// The agent loop has produced its final answer text (after any tool
+    /// calls have all been executed and observed).
+    LlmComplete,
+    /// The TTS session's first `Speak` for this turn is sent to Flux.
+    TtsStarted,
+    /// First raw PCM audio byte received back from Flux for this turn.
+    TtsFirstAudio,
+    /// First PCM chunk appended to the playback sink for this turn (audio is
+    /// now actually reaching the speakers).
+    PlaybackStarted,
+    /// The whole turn is done — either the fast-router path's confirmation
+    /// finished playing, or the agent loop + TTS both settled.
+    TurnComplete,
 }
 
 impl PipelineStage {
@@ -92,6 +136,19 @@ impl PipelineStage {
             Self::LlmFirstToken => "llm_first_token",
             Self::LlmTotal => "llm_total",
             Self::QuestionToAnswer => "question_to_answer",
+            Self::MicDetected => "mic_detected",
+            Self::SpeechStarted => "speech_started",
+            Self::SpeechEnded => "speech_ended",
+            Self::SttStarted => "stt_started",
+            Self::SttFirstResult => "stt_first_result",
+            Self::RouterStarted => "router_started",
+            Self::RouterDecision => "router_decision",
+            Self::LlmStarted => "llm_started",
+            Self::LlmComplete => "llm_complete",
+            Self::TtsStarted => "tts_started",
+            Self::TtsFirstAudio => "tts_first_audio",
+            Self::PlaybackStarted => "playback_started",
+            Self::TurnComplete => "turn_complete",
         }
     }
 }
@@ -170,6 +227,93 @@ impl FirstTokenTracker {
 impl Default for FirstTokenTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One full voice turn's worth of stage timestamps (mic detected through
+/// turn complete — see `PipelineStage`'s new variants), and the six derived
+/// latency numbers requested for observability: speech -> STT final, STT
+/// final -> router decision, STT final -> LLM first token, LLM first token
+/// -> TTS first audio, speech end -> first Veronica audio, and total turn
+/// latency. `mark()` is idempotent per stage (first call wins, later calls
+/// for the same stage are ignored) so a call site can call it defensively
+/// without worrying about double-marking skewing a duration — mirrors
+/// `FirstTokenTracker`'s existing "first delta only" behavior above.
+///
+/// Every timestamp is `Instant`-based (monotonic), matching this module's
+/// existing rule. `finish()` logs one summary line with every delta that had
+/// both of its endpoints marked — a turn that took the fast-router path
+/// (no LLM/TTS stages) still gets a useful summary with just its stages,
+/// rather than a line full of "n/a".
+#[derive(Default)]
+pub struct TurnTelemetry {
+    stages: std::sync::Mutex<std::collections::HashMap<&'static str, Instant>>,
+}
+
+impl TurnTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `stage` as having happened right now, unless it was already
+    /// marked earlier in this turn.
+    pub fn mark(&self, stage: PipelineStage) {
+        let mut guard = self.stages.lock().unwrap();
+        guard.entry(stage.label()).or_insert_with(Instant::now);
+    }
+
+    fn get(&self, stage: PipelineStage) -> Option<Instant> {
+        self.stages.lock().unwrap().get(stage.label()).copied()
+    }
+
+    fn delta_ms(&self, from: PipelineStage, to: PipelineStage) -> Option<i64> {
+        let (from, to) = (self.get(from)?, self.get(to)?);
+        Some(to.saturating_duration_since(from).as_millis() as i64)
+    }
+
+    /// Logs every per-stage line (via `log_stage_ms`, for whichever stages
+    /// were actually marked this turn) plus one summary line with the six
+    /// requested end-to-end deltas — call once, when the turn is fully done
+    /// (audio finished playing, or the fast-router path's confirmation
+    /// finished).
+    pub fn finish(&self, ctx: &PerfContext) {
+        let start = self.get(PipelineStage::MicDetected).or_else(|| self.get(PipelineStage::SpeechStarted));
+        let stages = self.stages.lock().unwrap();
+        let mut ordered: Vec<(&'static str, Instant)> = stages.iter().map(|(k, v)| (*k, *v)).collect();
+        drop(stages);
+        ordered.sort_by_key(|(_, at)| *at);
+        for (label, at) in &ordered {
+            if let Some(start) = start {
+                log::info!("perf: turn_stage={label} ms_since_turn_start={}", at.saturating_duration_since(start).as_millis());
+            }
+        }
+
+        let speech_to_stt_final = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::SttFinal);
+        let stt_final_to_router_decision = self.delta_ms(PipelineStage::SttFinal, PipelineStage::RouterDecision);
+        let stt_final_to_llm_first_token = self.delta_ms(PipelineStage::SttFinal, PipelineStage::LlmFirstToken);
+        let llm_first_token_to_tts_first_audio = self.delta_ms(PipelineStage::LlmFirstToken, PipelineStage::TtsFirstAudio);
+        let speech_end_to_first_audio = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::PlaybackStarted);
+        let total_turn_latency = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete);
+
+        log::info!(
+            "perf: turn_summary speech_to_stt_final_ms={} stt_final_to_router_decision_ms={} stt_final_to_llm_first_token_ms={} llm_first_token_to_tts_first_audio_ms={} speech_end_to_first_audio_ms={} total_turn_latency_ms={} tier={:?} mode={:?} pressure={:?}",
+            fmt_opt(speech_to_stt_final),
+            fmt_opt(stt_final_to_router_decision),
+            fmt_opt(stt_final_to_llm_first_token),
+            fmt_opt(llm_first_token_to_tts_first_audio),
+            fmt_opt(speech_end_to_first_audio),
+            fmt_opt(total_turn_latency),
+            ctx.tier,
+            ctx.mode,
+            ctx.pressure,
+        );
+    }
+}
+
+fn fmt_opt(ms: Option<i64>) -> String {
+    match ms {
+        Some(ms) => ms.to_string(),
+        None => "n/a".to_string(),
     }
 }
 
@@ -281,6 +425,19 @@ mod tests {
             PipelineStage::LlmFirstToken,
             PipelineStage::LlmTotal,
             PipelineStage::QuestionToAnswer,
+            PipelineStage::MicDetected,
+            PipelineStage::SpeechStarted,
+            PipelineStage::SpeechEnded,
+            PipelineStage::SttStarted,
+            PipelineStage::SttFirstResult,
+            PipelineStage::RouterStarted,
+            PipelineStage::RouterDecision,
+            PipelineStage::LlmStarted,
+            PipelineStage::LlmComplete,
+            PipelineStage::TtsStarted,
+            PipelineStage::TtsFirstAudio,
+            PipelineStage::PlaybackStarted,
+            PipelineStage::TurnComplete,
         ];
         for stage in stages {
             assert!(!stage.label().is_empty());
@@ -435,6 +592,61 @@ mod tests {
             log_stage_ms(PipelineStage::LlmFirstToken, ms, &ctx);
             panic!("should not have reached here — no mark() was called");
         }
+    }
+
+    // -- TurnTelemetry: the six requested per-turn latency deltas --
+
+    #[test]
+    fn turn_telemetry_computes_all_six_requested_deltas_when_fully_marked() {
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::MicDetected);
+        turn.mark(PipelineStage::SpeechEnded);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::SttFinal);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::RouterDecision);
+        turn.mark(PipelineStage::LlmFirstToken);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::TtsFirstAudio);
+        turn.mark(PipelineStage::PlaybackStarted);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::TurnComplete);
+
+        assert!(turn.delta_ms(PipelineStage::SpeechEnded, PipelineStage::SttFinal).unwrap() >= 2);
+        assert!(turn.delta_ms(PipelineStage::SttFinal, PipelineStage::RouterDecision).unwrap() >= 2);
+        assert!(turn.delta_ms(PipelineStage::LlmFirstToken, PipelineStage::TtsFirstAudio).unwrap() >= 2);
+        assert!(turn.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete).unwrap() >= 6);
+    }
+
+    #[test]
+    fn turn_telemetry_missing_stage_yields_none_not_a_panic() {
+        // A fast-router turn never marks LlmFirstToken/TtsFirstAudio at all —
+        // those deltas must come back None, not panic or report a bogus 0.
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        turn.mark(PipelineStage::RouterDecision);
+        turn.mark(PipelineStage::TurnComplete);
+        assert!(turn.delta_ms(PipelineStage::LlmFirstToken, PipelineStage::TtsFirstAudio).is_none());
+        assert!(turn.delta_ms(PipelineStage::SpeechEnded, PipelineStage::RouterDecision).is_some());
+    }
+
+    #[test]
+    fn turn_telemetry_mark_is_idempotent_first_call_wins() {
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        let first = turn.get(PipelineStage::SpeechEnded).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        turn.mark(PipelineStage::SpeechEnded);
+        let second = turn.get(PipelineStage::SpeechEnded).unwrap();
+        assert_eq!(first, second, "a later mark() for the same stage must not overwrite the first");
+    }
+
+    #[test]
+    fn turn_telemetry_finish_does_not_panic_on_a_partially_marked_turn() {
+        let ctx = PerfContext::new(HardwareTier::Standard, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        turn.finish(&ctx); // must not panic even though most stages/deltas are unmarked
     }
 
     // -- content-safety guard: the logging API cannot accept arbitrary text --

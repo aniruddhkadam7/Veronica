@@ -16,13 +16,19 @@ use crate::windows_capture_protection;
 pub const WIDGET_WINDOW_LABEL: &str = "veronica-widget";
 const WIDGET_TITLE: &str = "Veronica";
 
-/// Fixed square side. Sized generously around the 56px orb (see
-/// `.veronica-widget-orb` in overlay.css) so its glow rings — which expand
-/// to ~2.2x their base size while fading out — finish shrinking to nothing
-/// well before reaching the window edge. A tighter window clipped the ring's
-/// soft-edged glow against the window's hard rectangular boundary, which
-/// read as a faint square flickering in time with the pulse.
-const WIDGET_SIDE: f64 = 160.0;
+/// Default square side, used only until the user picks a different orb size
+/// in Settings (see `resize_veronica_widget`) — sized generously around the
+/// default 160px ParticlesOrb (see VeronicaWidget.tsx) so its particles'
+/// outward expansion/ripple at high energy states (listening/speaking)
+/// finishes well before reaching the window edge, which would otherwise clip
+/// that motion against the window's hard rectangular boundary.
+const WIDGET_SIDE: f64 = 220.0;
+
+/// How much bigger the window is than the orb it hosts, in both directions —
+/// same margin `WIDGET_SIDE`/160px default orb implies (220/160 = 1.375),
+/// kept as a ratio so `resize_veronica_widget` can preserve the same
+/// clipping-free clearance at any orb size the user picks.
+const WIDGET_MARGIN_RATIO: f64 = WIDGET_SIDE / 160.0;
 
 /// Gap from the right screen edge so the widget doesn't sit flush against
 /// the corner.
@@ -60,7 +66,12 @@ fn build_widget_window(app: &AppHandle) -> Result<WebviewWindow, String> {
     Ok(window)
 }
 
-fn dock_bottom_right(window: &WebviewWindow) {
+/// Docks the window to the bottom-right corner at the given square side.
+/// Re-docking (rather than just resizing in place) on every size change
+/// keeps the visible orb anchored to the same corner instead of growing
+/// toward the center of the screen, which is what a naive `set_size` alone
+/// would do (Tauri resizes from the window's top-left origin).
+fn dock_bottom_right(window: &WebviewWindow, side: f64) {
     let Ok(Some(monitor)) = window.primary_monitor() else {
         return;
     };
@@ -68,9 +79,9 @@ fn dock_bottom_right(window: &WebviewWindow) {
     let monitor_size = monitor.size().to_logical::<f64>(scale);
     let monitor_pos = monitor.position().to_logical::<f64>(scale);
 
-    let x = monitor_pos.x + monitor_size.width - WIDGET_SIDE - RIGHT_MARGIN;
-    let y = monitor_pos.y + monitor_size.height - WIDGET_SIDE - BOTTOM_MARGIN;
-    let _ = window.set_size(LogicalSize::new(WIDGET_SIDE, WIDGET_SIDE));
+    let x = monitor_pos.x + monitor_size.width - side - RIGHT_MARGIN;
+    let y = monitor_pos.y + monitor_size.height - side - BOTTOM_MARGIN;
+    let _ = window.set_size(LogicalSize::new(side, side));
     let _ = window.set_position(LogicalPosition::new(x, y));
 }
 
@@ -86,15 +97,16 @@ pub fn show_widget(app: &AppHandle) -> Result<(), String> {
     }
 
     if let Some(existing) = app.get_webview_window(WIDGET_WINDOW_LABEL) {
-        dock_bottom_right(&existing);
+        dock_bottom_right(&existing, WIDGET_SIDE);
         existing.show().map_err(|e| e.to_string())?;
-        let _ = windows_capture_protection::enable_capture_exclusion(&existing);
+        // Screen-capture exclusion is currently disabled — the widget should
+        // stay visible in screen shares/recordings. See show_overlay_window
+        // for the matching decision on the full overlay.
+        let _ = windows_capture_protection::disable_capture_exclusion(&existing);
     } else {
         let window = build_widget_window(app)?;
-        dock_bottom_right(&window);
-        if windows_capture_protection::enable_capture_exclusion(&window).is_err() {
-            log::warn!("Veronica widget: screen-capture exclusion FAILED/UNAVAILABLE");
-        }
+        dock_bottom_right(&window, WIDGET_SIDE);
+        let _ = windows_capture_protection::disable_capture_exclusion(&window);
         window.show().map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -107,6 +119,18 @@ pub fn hide_widget(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn resize_widget_inner(app: &AppHandle, orb_size: f64) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(WIDGET_WINDOW_LABEL) else {
+        // Not created yet (widget never shown this session) — Settings simply
+        // saves the choice (see widgetSettings.ts) for the next time it opens,
+        // nothing to resize right now.
+        return Ok(());
+    };
+    let side = orb_size * WIDGET_MARGIN_RATIO;
+    dock_bottom_right(&window, side);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn show_veronica_widget(app: AppHandle) -> Result<(), String> {
     crate::veronica_window::run_on_main(&app, |app| show_widget(app)).await
@@ -115,4 +139,13 @@ pub async fn show_veronica_widget(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn hide_veronica_widget(app: AppHandle) -> Result<(), String> {
     crate::veronica_window::run_on_main(&app, |app| hide_widget(app)).await
+}
+
+/// Applied when the user changes the orb size slider in Settings. Resizes
+/// and re-docks the (already-open) widget window to keep the same
+/// clipping-free margin around whatever size orb is now showing — a no-op if
+/// the widget hasn't been opened yet this session.
+#[tauri::command]
+pub async fn resize_veronica_widget(app: AppHandle, orb_size: f64) -> Result<(), String> {
+    crate::veronica_window::run_on_main(&app, move |app| resize_widget_inner(app, orb_size)).await
 }

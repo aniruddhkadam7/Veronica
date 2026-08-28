@@ -1,19 +1,34 @@
 //! Veronica: the one assistant behind the one overlay. `ask_veronica` is the
-//! single entry point — it answers a question OR, when the model's entire
-//! response is an `ACTION: <NAME> | <target>` directive (see
-//! `personal::prompts::veronica`'s ACTION-TAKING section), runs that action
-//! through `crate::actions` (registry safety check -> fastest-method
-//! router) and returns its result instead. Both cases stream through the
-//! same `veronica:answer-delta`/`veronica:answer-complete` events, so the
-//! overlay renders them identically — the user can't tell, from the UI,
-//! whether their message was answered or acted on.
+//! single entry point. Every turn:
+//!
+//!   1. cancels/interrupts whatever the previous turn was still doing
+//!      (`AppState::begin_turn`, and stops TTS if it was still speaking),
+//!   2. runs the deterministic fast router (`actions::fast_router`) —
+//!      obvious single-step commands ("open VS Code", "what's my CPU
+//!      usage") are matched here and executed immediately with **no LLM
+//!      call at all**,
+//!   3. anything the fast router doesn't recognize goes to the agent loop
+//!      (`personal::agent::run_agent_loop`), which streams text and can
+//!      call the same tools the fast router uses, in a real
+//!      UNDERSTAND -> DECIDE -> EXECUTE -> OBSERVE -> DECIDE NEXT loop —
+//!      not a hidden `ACTION:` text line parsed after the fact.
+//!
+//! Both paths stream through the same `veronica:answer-delta`/
+//! `veronica:answer-complete` events and the same persistent TTS session
+//! (`AppState.tts`, reused turn over turn rather than recreated), so the
+//! overlay renders/hears them identically regardless of which path
+//! answered.
+
+use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::actions;
-use crate::backend::{AskRequest, AskRetrievedChunk, ConversationTurn};
-use crate::rag::{RagClient, RetrievalPlanner};
+use crate::actions::{self, Capability, TaskControlOp, ToolOutcome};
+use crate::hardware::telemetry::{PipelineStage, TurnTelemetry};
+use crate::personal::agent::{run_agent_loop, AgentContent, AgentMessage};
+use crate::personal::prompts::veronica as prompts;
 use crate::state::AppState;
+use crate::tts::{SentenceChunker, TtsSession};
 
 /// Answer-shaping options chosen in the overlay's settings panel. Everything
 /// is optional: `Default` reproduces the plain "natural, default length"
@@ -32,7 +47,7 @@ pub struct AskOptions {
     #[serde(default)]
     pub llm_provider: Option<String>,
     /// The overlay's "Voice output" toggle. `false` (the default) skips TTS
-    /// entirely — no Deepgram request, no audio device opened, no added
+    /// entirely — no Flux session opened, no audio device opened, no added
     /// latency before the first token — matching how this whole feature
     /// must be a no-op end to end when the user hasn't opted in.
     #[serde(default)]
@@ -77,111 +92,122 @@ pub struct PriorTurn {
 /// style follow-ups, which almost always refer to the last exchange or two.
 const MAX_HISTORY_TURNS: usize = 6;
 
-/// Normalizes the overlay's conversation history into what the backend
+/// Normalizes the overlay's conversation history into what the agent loop
 /// wants: the most recent complete turns, still oldest-first. Incomplete
-/// turns are dropped rather than sent as empty strings — the backend schema
-/// requires non-empty text on both sides, so a turn whose answer failed or
-/// is still streaming would be rejected and take the whole request down
-/// with it.
-fn trim_history(turns: Vec<PriorTurn>) -> Vec<ConversationTurn> {
-    let mut history: Vec<ConversationTurn> = turns
-        .into_iter()
-        .filter(|t| !t.question.trim().is_empty() && !t.answer.trim().is_empty())
-        .map(|t| ConversationTurn { question: t.question.trim().to_string(), answer: t.answer.trim().to_string() })
-        .collect();
+/// turns are dropped rather than sent as empty strings — a turn whose
+/// answer failed or is still streaming would otherwise be replayed as an
+/// empty assistant turn.
+fn trim_history(turns: Vec<PriorTurn>) -> Vec<PriorTurn> {
+    let mut history: Vec<PriorTurn> = turns.into_iter().filter(|t| !t.question.trim().is_empty() && !t.answer.trim().is_empty()).collect();
     if history.len() > MAX_HISTORY_TURNS {
         history.drain(..history.len() - MAX_HISTORY_TURNS);
     }
     history
 }
 
-/// Fetches the full extracted text of the most recently uploaded document of
-/// `document_type`, bypassing RAG chunk search entirely. Short documents
-/// (a resume, notes) are cheap enough to just read in full — unlike the
-/// general "Upload documents" catch-all, there is no size reason to chunk
-/// and similarity-search them, and doing so only adds a race (the document
-/// may not have finished indexing yet) and a chance of missing/skipping
-/// content that full-text inclusion can't have. Returns `None` on any
-/// failure (RAG unavailable, no matching document, still extracting) — this
-/// must never fail the ask itself, only mean the answer proceeds without it.
-async fn fetch_document_full_text(document_type: &str) -> Option<String> {
-    let client = RagClient::new();
-    let documents = client.list_documents(None).await.ok()?;
-    let latest = documents
-        .into_iter()
-        .filter(|d| d.document_type == document_type && d.status == "READY")
-        .max_by(|a, b| a.updated_at.total_cmp(&b.updated_at))?;
-    client.get_document_text(&latest.document_id).await.ok().flatten()
-}
+/// Builds the agent loop's system message: the persona/voice/format prompt
+/// (`prompts::SYSTEM_PROMPT`, its former ACTION-TAKING section replaced by
+/// real tool-calling instructions — see that constant), plus this specific
+/// question's length/format target (reusing the exact same classifiers the
+/// old single-shot path used) and, when there's anything worth mentioning,
+/// the working-state context block so "it"/"this"/"the previous one"
+/// resolve.
+fn build_system_message(question: &str, options: &AskOptions, working_context: Option<String>) -> AgentMessage {
+    let format_line = match prompts::classify_format(question) {
+        Some(hint) => format!("{hint}\n\n"),
+        None => "Pick the matching FORMAT from the system prompt above.\n\n".to_string(),
+    };
+    let (length_hint, _budget) = prompts::classify_length(question);
 
-/// Whether searching the user's own attached documents could plausibly
-/// improve this answer.
-///
-/// Biased towards retrieving: a false positive costs one fast local search
-/// whose empty/irrelevant result is harmless, while a false negative loses
-/// real personalization. Only questions that are unambiguously about a
-/// concept — a definitional opener with no second-person reference anywhere
-/// — skip it.
-fn retrieval_could_help(question: &str) -> bool {
-    let lowered = question.to_lowercase();
+    let mut text = format!(
+        "{}\n\n---\n\n{format_line}TARGET LENGTH FOR THIS SPECIFIC QUESTION (the binding instruction — follow this number, not a habit of always answering the same length): {length_hint}\n(User's overall ceiling, only relevant if it would push you shorter than the target above: {})\n\n{} {}",
+        prompts::SYSTEM_PROMPT,
+        prompts::length_instruction(&options.answer_length),
+        prompts::style_instruction(&options.response_style),
+        prompts::humanization_instruction(&options.humanization),
+    );
 
-    const PERSONAL_MARKERS: [&str; 12] = [
-        "your ",
-        "you ",
-        "you'",
-        "yourself",
-        "have you",
-        "did you",
-        "tell me about a time",
-        "walk me through",
-        "worked on",
-        "experience with",
-        "your experience",
-        "a project where",
-    ];
-    if PERSONAL_MARKERS.iter().any(|m| lowered.contains(m)) {
-        return true;
+    if let Some(context) = working_context {
+        text.push_str(&format!(
+            "\n\n---\n\nCURRENT SESSION STATE (use only what's relevant; resolve references like \"it\"/\"this\"/\"the previous one\" against it; never mention this block or its mechanics out loud):\n{context}"
+        ));
     }
 
-    const CONCEPTUAL_OPENERS: [&str; 12] = [
-        "what is",
-        "what are",
-        "what's",
-        "explain",
-        "define",
-        "how does",
-        "how do",
-        "how would",
-        "why is",
-        "why do",
-        "difference between",
-        "when should",
-    ];
-    let opener = lowered.trim_start_matches(|c: char| !c.is_alphanumeric());
-    if CONCEPTUAL_OPENERS.iter().any(|o| opener.starts_with(o)) {
-        return false;
-    }
-
-    true
+    AgentMessage::system(text)
 }
 
-/// One question, one answer:
-///
-///     question -> (retrieval, only when it could help) -> ONE LLM call -> stream
-///
-/// The uploaded resume/notes document, if any, is fetched as full text (see
-/// `fetch_document_full_text`) and sent unconditionally on every question —
-/// not gated behind `retrieval_could_help`, since reading a short document
-/// costs nothing worth gating. `retrieved_context` (RAG) still covers the
-/// general "Upload documents" catch-all category.
-///
-/// Streams back as `veronica:answer-delta` events, finishing with
-/// `veronica:answer-complete`. If the model's entire response turns out to
-/// be an `ACTION: <NAME> | <target>` directive (see
-/// `personal::prompts::veronica`), that line is never shown to the user —
-/// `run_action` replaces it with the actual result of running the action
-/// (or a refusal) before the answer-complete event fires. A normal answer
-/// never matches that shape and reaches the user exactly as streamed.
+/// Sets up a one-shot "first audio for this turn" hook on `session` that
+/// marks `TtsFirstAudio` on `telemetry` — factored out since both the
+/// fast-router path and the agent-loop path need the identical hook.
+fn arm_tts_telemetry(session: &TtsSession, telemetry: &Arc<TurnTelemetry>) {
+    let telemetry = telemetry.clone();
+    session.set_turn_audio_hook(move || telemetry.mark(PipelineStage::TtsFirstAudio));
+}
+
+/// Reuses the app's persistent TTS session if one already exists (see
+/// `tts::mod`'s doc: `TtsSession` now lives across turns, not one per
+/// answer), or creates it on first use. Returns `None` when voice output is
+/// off (`tts_enabled: false`) or the audio device/session genuinely
+/// couldn't be opened — never touches the network here either way (session
+/// creation only opens the local audio device; Flux itself connects lazily
+/// on the first `speak()`).
+fn ensure_tts_session(app: &AppHandle, state: &AppState, tts_enabled: bool) -> Option<TtsSession> {
+    if !tts_enabled {
+        return None;
+    }
+    let mut guard = state.tts.lock().unwrap();
+    if let Some(session) = guard.as_ref() {
+        return Some(session.clone());
+    }
+    match TtsSession::start(state.tts_speaking.clone(), Some(app.clone())) {
+        Ok(session) => {
+            *guard = Some(session.clone());
+            Some(session)
+        }
+        Err(err) => {
+            log::warn!("Veronica: TTS unavailable, continuing text-only: {err}");
+            None
+        }
+    }
+}
+
+/// `Capability::TaskControl` mutates session state directly rather than
+/// running a native OS call — see `actions::capability`'s doc for why this
+/// never reaches `actions::execute_tool`.
+fn dispatch_task_control(state: &AppState, op: TaskControlOp) -> String {
+    let mut working = state.working_state.lock().unwrap();
+    match op {
+        TaskControlOp::Pause => {
+            if working.current_task.is_some() {
+                working.pause_task();
+                "Paused.".to_string()
+            } else {
+                "There's nothing running to pause.".to_string()
+            }
+        }
+        TaskControlOp::Resume => {
+            if working.current_task.as_ref().map(|t| t.status == crate::working_state::TaskStatus::Paused).unwrap_or(false) {
+                working.resume_task();
+                "Resuming.".to_string()
+            } else {
+                "There's nothing paused to resume.".to_string()
+            }
+        }
+        TaskControlOp::Cancel => {
+            if working.current_task.is_some() {
+                working.complete_task();
+                "Cancelled.".to_string()
+            } else {
+                "There's nothing running to cancel.".to_string()
+            }
+        }
+    }
+}
+
+/// One question, one turn — either the fast router's deterministic match
+/// (no LLM call) or the agent loop (streamed, tool-calling). Streams back
+/// as `veronica:answer-delta` events, finishing with
+/// `veronica:answer-complete`.
 #[tauri::command]
 pub async fn ask_veronica(
     app: AppHandle,
@@ -190,10 +216,6 @@ pub async fn ask_veronica(
     options: Option<AskOptions>,
     history: Option<Vec<PriorTurn>>,
 ) -> Result<String, String> {
-    use crate::hardware::telemetry::{finish, FirstTokenTracker, PipelineStage, Stopwatch};
-
-    let question_to_answer = Stopwatch::start();
-
     let trimmed = question.trim();
     if trimmed.is_empty() {
         return Err("no question text to send".into());
@@ -201,173 +223,130 @@ pub async fn ask_veronica(
     let options = options.unwrap_or_default();
     let history = trim_history(history.unwrap_or_default());
 
-    // Real "thinking has begun" signal for the orb widgets — emitted here,
-    // before any retrieval/LLM work starts, rather than left for the
-    // frontend to infer purely from "I called invoke() and haven't gotten a
-    // delta back yet". Cleared implicitly by the first `veronica:answer-delta`
-    // or by `veronica:answer-complete`/an Err from this command.
+    // Picks up the telemetry record the STT event thread started for this
+    // utterance (see `voice_command::mod`), or starts a fresh one for a
+    // typed/manual ask that never went through voice.
+    let telemetry = state.turn_telemetry.lock().unwrap().take().unwrap_or_else(|| Arc::new(TurnTelemetry::new()));
+
+    // A new turn supersedes whatever the previous one was still doing:
+    // cancels its in-flight generation (checked by the agent loop between
+    // iterations/chunks) and, if it was still audibly speaking, stops that
+    // too — barge-in's second line of defense alongside the RMS-based one
+    // in `voice_command::mod`'s mic pump, for turns that didn't arrive via
+    // that path (e.g. a fast typed follow-up).
+    let cancel = state.begin_turn();
+    if state.tts_speaking.is_speaking() {
+        if let Some(previous) = state.tts.lock().unwrap().as_ref() {
+            previous.stop();
+        }
+    }
+
     let _ = app.emit("veronica:thinking-start", ());
 
-    let resume_fetch = fetch_document_full_text("RESUME");
-
-    let retrieved = if retrieval_could_help(trimmed) {
-        let cfg = crate::hardware::effective_config_checked(&app);
-        let planner = RetrievalPlanner::new()
-            .with_config(cfg.rag_top_k, cfg.rag_similarity_threshold, cfg.rag_max_context_chars)
-            .with_timeout(std::time::Duration::from_millis(cfg.rag_retrieval_timeout_ms));
-        let retrieval_timer = Stopwatch::start();
-        let results = planner.plan_for_question(trimmed).await;
-        finish(retrieval_timer, PipelineStage::RagRetrieval, &crate::hardware::perf_context(&app));
-        results
-    } else {
-        log::debug!("Veronica: skipping retrieval for conceptual question");
-        Vec::new()
-    };
-
-    let candidate_context = resume_fetch.await;
-
-    let request = AskRequest {
-        question: trimmed.to_string(),
-        conversation_history: history,
-        retrieved_context: retrieved
-            .into_iter()
-            .filter(|r| r.metadata.document_type != "RESUME")
-            .map(|r| AskRetrievedChunk {
-                text: r.text,
-                source_filename: r.metadata.filename,
-                document_type: r.metadata.document_type,
-                score: r.score,
-            })
-            .collect(),
-        candidate_context,
-        answer_length: options.answer_length,
-        response_style: options.response_style,
-        humanization: options.humanization,
-        llm_provider: options.llm_provider,
-    };
-
-    // TTS speaks as the answer streams in, not after — see tts::SentenceChunker.
-    // A new question's TTS must never overlap a previous one still finishing
-    // playback, so any session left over from the last answer is stopped
-    // (synchronously, before this answer's first token) rather than only
-    // replaced at the end. A response that turns out to be an ACTION
-    // directive is deliberately never spoken — it's never shown to the user
-    // either (see below), and it has no natural-language sentence shape for
-    // the chunker to speak sensibly.
-    // Stopped unconditionally (not gated on this question's tts_enabled) —
-    // a user who disables voice output mid-answer, or asks a fast follow-up
-    // right after toggling it off, must still cut off whatever the previous
-    // answer was still saying.
-    if let Some(previous) = state.tts.lock().unwrap().take() {
-        previous.stop();
+    let tts_session = ensure_tts_session(&app, &state, options.tts_enabled);
+    if let Some(session) = tts_session.as_ref() {
+        session.begin_turn();
     }
-    // `TtsSession` is cheaply `Clone` (an mpsc::Sender + an Arc<AtomicBool>)
-    // so both the streaming `on_delta` closure below AND the post-stream
-    // trailing-chunk/handoff code after `ask_stream` can each hold their own
-    // clone of the same underlying session/player thread.
-    let tts_session: Option<crate::tts::TtsSession> = if options.tts_enabled {
-        match crate::tts::TtsSession::start(state.tts_speaking.clone(), Some(app.clone())) {
-            Ok(session) => Some(session),
-            Err(err) => {
-                log::warn!("Veronica: TTS unavailable, continuing text-only: {err}");
-                None
+
+    telemetry.mark(PipelineStage::RouterStarted);
+    let fast_match = actions::fast_router::try_match(trimmed);
+    telemetry.mark(PipelineStage::RouterDecision);
+
+    let answer = match fast_match {
+        Some(Capability::TaskControl(op)) => {
+            let result = dispatch_task_control(&state, op);
+            if let Some(session) = tts_session.as_ref() {
+                arm_tts_telemetry(session, &telemetry);
+                telemetry.mark(PipelineStage::TtsStarted);
+                session.speak_now(&result);
             }
+            let _ = app.emit("veronica:answer-delta", &result);
+            result
         }
-    } else {
-        None
-    };
-    let tts_chunker = std::sync::Arc::new(std::sync::Mutex::new(crate::tts::SentenceChunker::new()));
-    let tts_saw_first_chunk = std::sync::Arc::new(std::sync::Mutex::new(false));
-
-    let app_for_events = app.clone();
-    let llm_timer = Stopwatch::start();
-    let first_token = FirstTokenTracker::new();
-    let first_token_recorder = first_token.recorder();
-    let tts_enabled = options.tts_enabled;
-    let tts_session_for_delta = tts_session.clone();
-    let tts_chunker_for_delta = tts_chunker.clone();
-    let tts_saw_first_chunk_for_delta = tts_saw_first_chunk.clone();
-    let on_delta = move |delta: &str| {
-        first_token_recorder.mark();
-        let _ = app_for_events.emit("veronica:answer-delta", delta);
-
-        // Skip the chunker entirely when TTS is off — no locking, no
-        // buffering, nothing beyond the two lines above; this is what makes
-        // the feature a true no-op end to end for the common case.
-        if !tts_enabled {
-            return;
-        }
-        let Some(session) = tts_session_for_delta.as_ref() else { return };
-        let chunks = tts_chunker_for_delta.lock().unwrap().push(delta);
-        for chunk in chunks {
-            let mut first_guard = tts_saw_first_chunk_for_delta.lock().unwrap();
-            if !*first_guard {
-                *first_guard = true;
-                if chunk.starts_with("ACTION:") {
-                    // Whole answer is (so far) shaping up to be an action
-                    // directive — stop speaking anything from this session;
-                    // the user will never see this text either.
-                    session.stop();
-                    continue;
-                }
-            }
-            session.speak(&chunk);
-        }
-    };
-    let raw_answer = crate::personal::DirectLlmClient::new(request.llm_provider.as_deref())?
-        .ask_stream(&request, on_delta)
-        .await?;
-
-    let ctx = crate::hardware::perf_context(&app);
-    if let Some(ms) = first_token.elapsed_ms() {
-        crate::hardware::telemetry::log_stage_ms(PipelineStage::LlmFirstToken, ms, &ctx);
-    }
-    finish(llm_timer, PipelineStage::LlmTotal, &ctx);
-
-    // The model's entire response is checked against the ACTION line shape
-    // (not just its first line) — a normal answer never matches this, so
-    // this is a fast no-op for every ordinary question. Only when it
-    // matches do we run the action and swap in its result; the raw
-    // "ACTION: ..." line is never shown to the user.
-    let answer = match actions::parse_action_line(&raw_answer) {
-        Some(intent) => {
-            // Real "executing an action" signal for the orb widgets — this
-            // whole branch previously ran silently between the LLM stream
-            // ending and `veronica:answer-complete` firing, indistinguishable
-            // from a slow normal answer. `intent`'s Debug form is a fixed,
-            // known-safe label (one of the six Intent variants; see
-            // actions::mod's doc) — never model-generated free text.
-            let _ = app.emit("veronica:action-start", format!("{intent:?}"));
-            // Never spoken (see the ACTION guard above) — nothing left to
-            // do here but let any already-stopped session stay stopped.
-            let result = actions::execute(intent).await;
+        Some(capability) => {
+            let _ = app.emit("veronica:action-start", format!("{capability:?}"));
+            let outcome = actions::execute_tool(&capability).await;
             let _ = app.emit("veronica:action-complete", ());
+            let result = match outcome {
+                Ok(ToolOutcome::Text(text)) => text,
+                Ok(ToolOutcome::Image { .. }) => "Done.".to_string(), // CaptureScreen never fast-routes — see capability.rs
+                Err(err) => err,
+            };
+            state.working_state.lock().unwrap().record_action(format!("{capability:?}"), result.clone());
+            if let Some(session) = tts_session.as_ref() {
+                arm_tts_telemetry(session, &telemetry);
+                telemetry.mark(PipelineStage::TtsStarted);
+                session.speak_now(&result);
+            }
+            let _ = app.emit("veronica:answer-delta", &result);
             result
         }
         None => {
-            if let Some(session) = tts_session.as_ref() {
-                if let Some(trailing) = tts_chunker.lock().unwrap().finish() {
-                    session.speak(&trailing);
+            telemetry.mark(PipelineStage::LlmStarted);
+
+            let client = crate::personal::DirectLlmClient::new(options.llm_provider.as_deref())?;
+            let provider = client.agentic_provider();
+
+            let working_context = state.working_state.lock().unwrap().render_context_block();
+            let mut messages = vec![build_system_message(trimmed, &options, working_context)];
+            for turn in &history {
+                messages.push(AgentMessage::user_text(turn.question.clone()));
+                messages.push(AgentMessage::assistant_text(turn.answer.clone()));
+            }
+            messages.push(AgentMessage::user_text(trimmed));
+
+            let chunker = Arc::new(Mutex::new(SentenceChunker::new()));
+            let app_for_delta = app.clone();
+            let telemetry_for_delta = telemetry.clone();
+            let tts_for_delta = tts_session.clone();
+            let chunker_for_delta = chunker.clone();
+            let armed_for_delta = std::sync::atomic::AtomicBool::new(false);
+            let on_text_delta = |delta: &str| {
+                telemetry_for_delta.mark(PipelineStage::LlmFirstToken);
+                let _ = app_for_delta.emit("veronica:answer-delta", delta);
+                let Some(session) = tts_for_delta.as_ref() else { return };
+                if !armed_for_delta.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    arm_tts_telemetry(session, &telemetry_for_delta);
+                    telemetry_for_delta.mark(PipelineStage::TtsStarted);
+                }
+                for chunk in chunker_for_delta.lock().unwrap().push(delta) {
+                    session.speak(&chunk);
+                }
+            };
+
+            let outcome = run_agent_loop(provider.as_ref(), messages, &cancel, on_text_delta).await;
+            telemetry.mark(PipelineStage::LlmComplete);
+
+            match outcome {
+                Ok(agent_outcome) => {
+                    if !agent_outcome.actions_taken.is_empty() {
+                        let mut working = state.working_state.lock().unwrap();
+                        for action_summary in &agent_outcome.actions_taken {
+                            working.record_action(action_summary.clone(), agent_outcome.final_text.clone());
+                        }
+                    }
+                    if let Some(session) = tts_session.as_ref() {
+                        if let Some(trailing) = chunker.lock().unwrap().finish() {
+                            session.speak(&trailing);
+                        }
+                        session.finish();
+                    }
+                    agent_outcome.final_text
+                }
+                Err(err) => {
+                    // A cancelled turn (superseded by a newer utterance) has
+                    // no answer to show — the frontend's next turn is
+                    // already in flight, this one just quietly stops.
+                    let _ = app.emit("veronica:answer-complete", "");
+                    return Err(err);
                 }
             }
-            raw_answer
         }
     };
 
-    // Hand the (possibly still-speaking) session to AppState instead of
-    // stopping it here — playback of the last sentence(s) continues in the
-    // background after this command returns; it's stopped either by the
-    // next question (the take()+stop() above) or when the overlay session
-    // resets. This is a clone of the same underlying player thread/channel
-    // `on_delta` spoke through, not a separate session — dropping this
-    // clone doesn't stop playback, only `TtsSession::stop()` does.
-    if let Some(session) = tts_session {
-        if let Ok(mut slot) = state.tts.lock() {
-            *slot = Some(session);
-        }
-    }
+    telemetry.mark(PipelineStage::TurnComplete);
+    telemetry.finish(&crate::hardware::perf_context(&app));
 
-    finish(question_to_answer, PipelineStage::QuestionToAnswer, &crate::hardware::perf_context(&app));
     let _ = app.emit("veronica:answer-complete", &answer);
     Ok(answer)
 }
@@ -393,33 +372,28 @@ fn pick_greeting() -> &'static str {
     GREETINGS[(nanos as usize) % GREETINGS.len()]
 }
 
-/// Speaks a short greeting line via TTS, independent of the LLM/ask
-/// pipeline — used only when the overlay is auto-opened by the global
-/// hotkey/tray from a fully-closed state (see `veronica_window::wake_veronica`
-/// and `VeronicaOverlay.tsx`'s `veronica:auto-opened` listener). Best-effort
-/// like every other TTS call in this app: a missing `DEEPGRAM_API_KEY` or a
+/// Speaks a short greeting line via TTS, independent of the ask pipeline —
+/// used only when the overlay is auto-opened by the global hotkey/tray from
+/// a fully-closed state (see `veronica_window::wake_veronica` and
+/// `VeronicaOverlay.tsx`'s `veronica:auto-opened` listener). Best-effort
+/// like every other TTS call in this app: a missing Deepgram API key or a
 /// network failure just means no line is spoken, never an error surfaced to
 /// the UI — the visual greeting animation carries the moment on its own.
-///
-/// Replaces (stops) whatever the previous `ask_veronica` answer might still
-/// be speaking, same as a fresh question would, so the greeting is never
-/// talked over.
 #[tauri::command]
 pub async fn speak_greeting(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
-    if let Some(previous) = state.tts.lock().unwrap().take() {
-        previous.stop();
+    let cancel = state.begin_turn();
+    let _ = cancel; // no generation to cancel for a fixed greeting line, but a fresh turn still supersedes any in-flight one
+    if state.tts_speaking.is_speaking() {
+        if let Some(previous) = state.tts.lock().unwrap().as_ref() {
+            previous.stop();
+        }
     }
     let line = pick_greeting();
-    match crate::tts::TtsSession::start(state.tts_speaking.clone(), Some(app)) {
-        Ok(session) => {
-            session.speak(line);
-            if let Ok(mut slot) = state.tts.lock() {
-                *slot = Some(session);
-            }
-        }
-        Err(err) => {
-            log::warn!("Veronica: TTS unavailable for greeting, showing text only: {err}");
-        }
+    if let Some(session) = ensure_tts_session(&app, &state, true) {
+        session.begin_turn();
+        session.speak_now(line);
+    } else {
+        log::warn!("Veronica: TTS unavailable for greeting, showing text only");
     }
     Ok(line.to_string())
 }
@@ -434,9 +408,7 @@ mod tests {
 
     #[test]
     fn history_keeps_the_most_recent_turns_oldest_first() {
-        let turns: Vec<PriorTurn> = (0..MAX_HISTORY_TURNS + 3)
-            .map(|i| turn(&format!("q{i}"), &format!("a{i}")))
-            .collect();
+        let turns: Vec<PriorTurn> = (0..MAX_HISTORY_TURNS + 3).map(|i| turn(&format!("q{i}"), &format!("a{i}"))).collect();
         let trimmed = trim_history(turns);
 
         assert_eq!(trimmed.len(), MAX_HISTORY_TURNS);
@@ -446,12 +418,7 @@ mod tests {
 
     #[test]
     fn history_drops_incomplete_turns() {
-        let trimmed = trim_history(vec![
-            turn("answered", "yes"),
-            turn("still streaming", ""),
-            turn("", "orphan answer"),
-            turn("  ", "   "),
-        ]);
+        let trimmed = trim_history(vec![turn("answered", "yes"), turn("still streaming", ""), turn("", "orphan answer"), turn("  ", "   ")]);
         assert_eq!(trimmed.len(), 1);
         assert_eq!(trimmed[0].question, "answered");
     }
@@ -462,21 +429,42 @@ mod tests {
     }
 
     #[test]
-    fn conceptual_questions_skip_retrieval() {
-        assert!(!retrieval_could_help("What is RAG?"));
-        assert!(!retrieval_could_help("How does garbage collection work?"));
-    }
-
-    #[test]
-    fn personal_questions_retrieve() {
-        assert!(retrieval_could_help("Tell me about your experience with Python."));
-        assert!(retrieval_could_help("What is your experience with Kubernetes?"));
-    }
-
-    #[test]
     fn ask_options_default_to_natural_default_length() {
         let options = AskOptions::default();
         assert_eq!(options.answer_length, "default");
         assert_eq!(options.response_style, "natural");
+    }
+
+    #[test]
+    fn build_system_message_includes_working_context_when_present() {
+        let options = AskOptions::default();
+        let message = build_system_message("open vs code", &options, Some("Current task: testing".to_string()));
+        let AgentContent::Text(text) = &message.content[0] else { panic!("expected text content") };
+        assert!(text.contains("Current task: testing"));
+    }
+
+    #[test]
+    fn build_system_message_omits_the_context_block_when_none() {
+        let options = AskOptions::default();
+        let message = build_system_message("what is rust", &options, None);
+        let AgentContent::Text(text) = &message.content[0] else { panic!("expected text content") };
+        assert!(!text.contains("CURRENT SESSION STATE"));
+    }
+
+    #[test]
+    fn dispatch_task_control_pause_with_no_active_task_says_so() {
+        let state = AppState::default();
+        let result = dispatch_task_control(&state, TaskControlOp::Pause);
+        assert_eq!(result, "There's nothing running to pause.");
+    }
+
+    #[test]
+    fn dispatch_task_control_pause_then_resume_round_trips() {
+        let state = AppState::default();
+        state.working_state.lock().unwrap().start_task("find and fix the bug");
+        let paused = dispatch_task_control(&state, TaskControlOp::Pause);
+        assert_eq!(paused, "Paused.");
+        let resumed = dispatch_task_control(&state, TaskControlOp::Resume);
+        assert_eq!(resumed, "Resuming.");
     }
 }

@@ -3,12 +3,21 @@ import { PerformancePanel } from "./PerformancePanel";
 import { PersonalizationPanel } from "./PersonalizationPanel";
 import { AttachedDocumentsPanel } from "./AttachedDocumentsPanel";
 import { PersonalApiKeySettings } from "./PersonalApiKeySettings";
+import { WidgetPanel } from "./WidgetPanel";
 import type { PersonalLlmProvider } from "./personalApiKeys";
 
-type SettingsSection = "PERSONALIZATION" | "PERFORMANCE" | "CONTEXT" | "API_KEYS" | "PRIVACY" | "ABOUT";
+type SettingsSection =
+  | "PERSONALIZATION"
+  | "WIDGET"
+  | "PERFORMANCE"
+  | "CONTEXT"
+  | "API_KEYS"
+  | "PRIVACY"
+  | "ABOUT";
 
 const SECTIONS: { key: SettingsSection; label: string }[] = [
   { key: "PERSONALIZATION", label: "Personalization" },
+  { key: "WIDGET", label: "Widget" },
   { key: "PERFORMANCE", label: "Performance" },
   { key: "CONTEXT", label: "Context / Documents" },
   { key: "API_KEYS", label: "API Keys" },
@@ -56,6 +65,7 @@ export function SettingsPopover({ onClose, onApiKeySaved }: Props) {
 
           <div className="settings-popover-content">
             {section === "PERSONALIZATION" && <PersonalizationPanel />}
+            {section === "WIDGET" && <WidgetPanel />}
             {section === "PERFORMANCE" && <PerformancePanel />}
             {section === "CONTEXT" && <AttachedDocumentsPanel />}
             {section === "API_KEYS" && <PersonalApiKeySettings onKeySaved={onApiKeySaved} />}

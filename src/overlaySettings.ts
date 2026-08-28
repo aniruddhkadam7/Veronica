@@ -20,7 +20,7 @@ export interface OverlaySettings {
   answerLength: AnswerLength;
   responseStyle: ResponseStyle;
   humanization: Humanization;
-  // Speaks each answer aloud via Deepgram Cloud TTS (Aura-1) as it streams
+  // Speaks each answer aloud via Deepgram Flux TTS (flux-sienna-en) as it streams
   // in — see veronica::ask_veronica's tts_enabled option. Off by default:
   // voice output is opt-in, matching the general no-surprise-network-calls
   // posture elsewhere in this app (RAG retrieval, cloud LLM calls are all

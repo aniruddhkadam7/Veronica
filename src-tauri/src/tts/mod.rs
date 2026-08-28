@@ -1,15 +1,22 @@
-//! Text-to-speech: Deepgram Cloud (Aura-1) is the only provider. There is no
-//! local model and no fallback — if `DEEPGRAM_API_KEY` is missing or a
-//! request fails (timeout, rate limit, network error), that sentence is
-//! simply not spoken and a warning is logged; the text answer itself is
-//! never affected, since TTS is purely an add-on to the existing
-//! LLM -> text pipeline (see `veronica::ask_veronica`).
+//! Text-to-speech: Deepgram Flux (`flux-sienna-en`, over a streaming `wss://`
+//! session) is the only provider. There is no local model and no fallback —
+//! if the Deepgram API key is missing or the session fails (connect
+//! failure, network error), the rest of that answer is simply not spoken
+//! and a warning is logged; the text answer itself is never affected, since
+//! TTS is purely an add-on to the existing LLM -> text pipeline (see
+//! `veronica::ask_veronica`).
 //!
-//! `TtsSession` owns one answer's worth of speech: created when an answer
-//! with voice output enabled starts streaming, fed one sentence at a time
-//! via `speak()` as `SentenceChunker` completes them, and handed off to
-//! `AppState` once the LLM stream ends so playback of the last sentence(s)
-//! can finish in the background after the Tauri command returns.
+//! `TtsSession` is now a persistent, cross-turn object — created once when
+//! the mic-assistant session activates and held in `AppState` for the whole
+//! session's lifetime, not recreated per answer. Each turn calls
+//! `begin_turn()` then feeds text via `speak()`/`speak_now()` (one sentence
+//! at a time as `SentenceChunker` completes them, or immediately for a short
+//! response with no chunker involved) and `finish()` once the turn's text is
+//! done. Consecutive turns reuse the same underlying Flux WebSocket
+//! connection whenever the server has kept it open (see
+//! `deepgram_flux::FluxSession::is_alive`), rather than paying a fresh
+//! TCP+TLS+WebSocket handshake on every single turn — only a hard `stop()`
+//! (barge-in) or a genuine connection failure opens a new one.
 //!
 //! `TtsSession` is `Send`/`Sync` (safe to store in `AppState`, a Tauri
 //! `State`) — see `player`'s module doc for why that required keeping
@@ -17,14 +24,15 @@
 //! rather than held here directly.
 
 mod chunker;
-mod deepgram;
+mod deepgram_flux;
 mod player;
 
 pub use chunker::SentenceChunker;
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
+use deepgram_flux::FluxSession;
 use player::PlaybackHandle;
 
 /// Ground truth for "is Veronica's own voice coming out of the speakers
@@ -34,37 +42,33 @@ use player::PlaybackHandle;
 /// it — just a mic and speakers in the same room) doesn't get transcribed
 /// and answered as if the user said it.
 ///
-/// `true` for as long as EITHER any `speak()` call's Deepgram request hasn't
-/// finished yet, OR the player's audio sink hasn't finished playing
-/// everything already appended — both conditions matter independently:
-/// a long pause between sentence 1 finishing and sentence 2's (still
-/// synthesizing) first chunk arriving must not flip this to `false` for
-/// even a moment, and a still-in-the-sink final sentence must keep it
-/// `true` after every `speak()` call has already returned. Combining both
-/// into one type (rather than checking them separately at each call site)
-/// is what makes that combination correct in one place, not something every
-/// caller has to get right.
+/// `true` for as long as EITHER this answer's Flux session hasn't been
+/// flushed/closed yet, OR the player's audio sink hasn't finished playing
+/// everything already appended — both conditions matter independently: a
+/// long pause between the session opening and its first audio chunk
+/// arriving must not flip this to `false` for even a moment, and a
+/// still-in-the-sink final sentence must keep it `true` after the session
+/// itself has already closed. Combining both into one type (rather than
+/// checking them separately at each call site) is what makes that
+/// combination correct in one place, not something every caller has to get
+/// right.
 #[derive(Clone, Default)]
 pub struct TtsSpeakingSignal {
-    /// Count of `speak()` calls whose Deepgram request thread hasn't
-    /// finished yet (success or failure — either way it stops counting once
-    /// that thread sends its final marker). `AtomicI64`, not `AtomicU64`:
-    /// signed so a bug that double-decrements is loud (goes negative,
-    /// visibly wrong) rather than wrapping to a huge unsigned value that
-    /// would silently jam the mic muted forever.
-    pending_sentences: Arc<AtomicI64>,
+    /// Whether an answer's Flux session is currently open (from
+    /// `TtsSession::start` until `stop()`/the LLM stream ending and the
+    /// session finishing). `AtomicBool`, not a counter: unlike the old
+    /// per-sentence-HTTP-request model where multiple concurrent requests
+    /// could be in flight at once, there is now at most one Flux session
+    /// per `TtsSession`, so a single flag is enough.
+    session_open: Arc<AtomicBool>,
     /// Whether the player's sink has audio queued or playing right now.
-    /// Distinct from `pending_sentences` — see the struct doc.
+    /// Distinct from `session_open` — see the struct doc.
     sink_active: Arc<AtomicBool>,
 }
 
 impl TtsSpeakingSignal {
-    fn on_sentence_started(&self) {
-        self.pending_sentences.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn on_sentence_finished(&self) {
-        self.pending_sentences.fetch_sub(1, Ordering::SeqCst);
+    fn set_session_open(&self, open: bool) {
+        self.session_open.store(open, Ordering::SeqCst);
     }
 
     fn set_sink_active(&self, active: bool) {
@@ -74,14 +78,14 @@ impl TtsSpeakingSignal {
     /// Whether the mic-assistant pump should currently withhold audio from
     /// STT. See the struct doc for why both conditions are checked.
     pub fn is_speaking(&self) -> bool {
-        self.pending_sentences.load(Ordering::SeqCst) > 0 || self.sink_active.load(Ordering::SeqCst)
+        self.session_open.load(Ordering::SeqCst) || self.sink_active.load(Ordering::SeqCst)
     }
 
     /// Forces both conditions clear — used by `TtsSession::stop()` so an
     /// interrupted answer un-mutes the mic immediately rather than waiting
-    /// for in-flight request threads to notice they were stopped.
+    /// for the Flux session to notice it was stopped.
     fn force_clear(&self) {
-        self.pending_sentences.store(0, Ordering::SeqCst);
+        self.session_open.store(false, Ordering::SeqCst);
         self.sink_active.store(false, Ordering::SeqCst);
     }
 }
@@ -89,34 +93,49 @@ impl TtsSpeakingSignal {
 #[derive(Clone)]
 pub struct TtsSession {
     player: PlaybackHandle,
+    /// The live Flux session for this answer, created lazily on the first
+    /// `speak()` call rather than in `start()` — `start()` must succeed
+    /// whenever the audio device opens, even with no API key configured
+    /// yet or before the answer's first sentence exists to speak (mirrors
+    /// the old per-sentence client's "never touches the network until
+    /// there's something to say" behavior). `Mutex<Option<..>>` because
+    /// `TtsSession` is cheaply `Clone`d (see `veronica::ask_veronica`,
+    /// which holds two clones of the same session) and every clone must
+    /// share the same one-session-per-answer state, not create its own.
+    flux: Arc<Mutex<Option<FluxSession>>>,
     stopped: Arc<AtomicBool>,
     speaking: TtsSpeakingSignal,
-    /// Assigns each `speak()` call a sequence number in call order — see
-    /// `player`'s module doc for why: two sentences' Deepgram requests run
-    /// concurrently for latency, so their PCM chunks can arrive at the
-    /// player interleaved rather than one sentence fully at a time. The
-    /// player uses `seq` to always append audio to the sink in sentence
-    /// order regardless of arrival order. `Arc<AtomicU64>` (not a plain
-    /// counter) because `TtsSession` is cheaply `Clone`d (see
-    /// `veronica::ask_veronica`, which holds two clones of the same
-    /// session) — every clone must share one counter, not restart its own.
-    next_seq: Arc<AtomicU64>,
-    /// Only used to emit `veronica:error` when a sentence's Deepgram request
-    /// fails (see `speak()`) — the orb widgets' only path to learning about a
-    /// per-sentence TTS failure, which previously had no way to reach the
-    /// frontend at all (a background thread, no command in flight to reject).
-    /// `None` in the `#[cfg(test)]` unit test below, which has no `AppHandle`
-    /// and simply emits nothing on failure, exactly as before this field
+    /// Only used to emit `veronica:error` when this answer's Flux session
+    /// fails (see `speak()`) — the orb widgets' only path to learning about
+    /// a TTS failure, which previously had no way to reach the frontend at
+    /// all (a background thread, no command in flight to reject). `None` in
+    /// the `#[cfg(test)]` unit test below, which has no `AppHandle` and
+    /// simply emits nothing on failure, exactly as before this field
     /// existed.
     app: Option<tauri::AppHandle>,
+    /// Fired at most once per turn, on the first raw PCM chunk received
+    /// back from Flux for that turn — real per-turn `tts_first_audio`
+    /// telemetry (see `hardware::telemetry::PipelineStage::TtsFirstAudio`),
+    /// not an approximation. Set via `set_turn_audio_hook` at the start of
+    /// each turn (typically right after `begin_turn()`); taken (and so
+    /// cleared) the moment it fires, so a later chunk in the same turn — or
+    /// any chunk in a turn that never set a hook — does nothing here.
+    /// `PlaybackStarted` is deliberately not tracked as a separate signal:
+    /// `on_audio` below calls `player.enqueue()` synchronously right after
+    /// this fires, and rodio begins playing newly-appended data essentially
+    /// immediately, so the gap between "PCM bytes received" and "audio
+    /// reaching the speakers" is sub-millisecond — not a real latency worth
+    /// its own instrumentation point, unlike the network/synthesis gap this
+    /// hook does measure (LLM first token -> TTS first audio).
+    on_first_audio_this_turn: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl TtsSession {
     /// Opens the default audio output device (on its own dedicated thread —
     /// see `player`'s module doc) and starts the background PCM relay.
     /// Fails only if the device itself can't be opened (no speakers, driver
-    /// issue) — never touches the network or `DEEPGRAM_API_KEY` here, so a
-    /// missing/invalid key surfaces per sentence in `speak()` instead of
+    /// issue) — never touches the network or the Deepgram API key here, so
+    /// a missing/invalid key surfaces on the first `speak()` call instead of
     /// failing session creation outright.
     ///
     /// `speaking` is threaded through from `AppState` (see
@@ -129,80 +148,154 @@ impl TtsSession {
         let player = PlaybackHandle::start(speaking.clone())?;
         Ok(Self {
             player,
+            flux: Arc::new(Mutex::new(None)),
             stopped: Arc::new(AtomicBool::new(false)),
             speaking,
-            next_seq: Arc::new(AtomicU64::new(0)),
             app,
+            on_first_audio_this_turn: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Synthesizes and queues one sentence. Runs the Deepgram request on a
-    /// dedicated thread (see `tts::deepgram`'s module doc for why: the
-    /// caller is a synchronous closure inside an async streaming loop, and
-    /// must not block on network I/O) so multiple sentences from the same
-    /// answer can be in flight to Deepgram concurrently for lower latency,
-    /// while the player (see `player`'s module doc) still guarantees
-    /// sentence-ordered, non-interleaved playback via each call's `seq`.
+    /// Registers a one-shot callback for this turn's first received audio
+    /// chunk — see the `on_first_audio_this_turn` field doc. Call once per
+    /// turn, after `begin_turn()`, only when the caller actually wants this
+    /// signal (real callers pass a closure that marks `TurnTelemetry`;
+    /// nothing is scheduled/polled when no hook is set).
+    pub fn set_turn_audio_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.on_first_audio_this_turn.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Streams one sentence/chunk of text into the current Flux turn,
+    /// opening the WebSocket session on the very first call (see the `flux`
+    /// field doc) or reusing whatever session is already open from a prior
+    /// turn — `TtsSession` is now a per-app-session, cross-turn object (see
+    /// `veronica::ask_veronica`), not a fresh one per answer, so most calls
+    /// reuse an already-connected socket rather than paying a new
+    /// TCP+TLS+WebSocket handshake on every turn. If the previously-open
+    /// session's I/O thread has since exited (the server closed the
+    /// connection after the last turn's `Flush` — some turn-based streaming
+    /// protocols do this) `FluxSession::is_alive()` catches that and a fresh
+    /// session is opened transparently, exactly as if this were the first
+    /// call — see that method's doc.
     ///
-    /// Any Deepgram failure is logged and that one sentence is silently
-    /// skipped — never a fallback to another engine (there is none), never
-    /// an error surfaced to the answer text itself. A failed/skipped
-    /// sentence's `seq` still gets an `is_last` marker sent (see below) so
-    /// the player doesn't stall forever waiting for a sentence that will
-    /// never otherwise report completion.
+    /// Any connect/send failure is logged and the rest of this answer is
+    /// silently skipped — never a fallback to another engine (there is
+    /// none), never an error surfaced to the answer text itself.
     pub fn speak(&self, text: &str) {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let text = text.to_string();
-        let player = self.player.clone();
-        let stopped = self.stopped.clone();
-        let speaking = self.speaking.clone();
-        let app = self.app.clone();
-        speaking.on_sentence_started();
-        std::thread::Builder::new()
-            .name("tts-deepgram-request".into())
-            .spawn(move || {
-                let result = deepgram::speak_streaming(&text, |chunk| {
-                    if stopped.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    player.enqueue(seq, chunk.to_vec(), false);
-                });
-                if let Err(err) = result {
-                    log::warn!("Deepgram TTS failed for one sentence, skipping it: {err}");
-                    if let Some(app) = app.as_ref() {
+        // Set on every call, not only when a session is freshly created —
+        // reusing an already-open connection is still "speaking" for the
+        // mic-mute signal's purposes; this used to only be set inside the
+        // creation branch below, which was correct back when every turn
+        // always created a fresh session, but would otherwise silently never
+        // mute the mic on a turn that reuses an existing connection.
+        self.speaking.set_session_open(true);
+        let mut guard = self.flux.lock().unwrap();
+        let needs_new_session = !matches!(guard.as_ref(), Some(session) if session.is_alive());
+        if needs_new_session {
+            *guard = None;
+            let player = self.player.clone();
+            let stopped = self.stopped.clone();
+            let speaking = self.speaking.clone();
+            let app = self.app.clone();
+            let stopped_for_audio = stopped.clone();
+            let audio_hook = self.on_first_audio_this_turn.clone();
+            let on_audio = move |chunk: &[u8]| {
+                if stopped_for_audio.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(hook) = audio_hook.lock().unwrap().take() {
+                    hook();
+                }
+                player.enqueue(chunk.to_vec());
+            };
+            let speaking_for_error = speaking.clone();
+            let on_error = move |err: deepgram_flux::FluxError| {
+                log::warn!("Deepgram Flux TTS failed, rest of this answer won't be spoken: {err}");
+                if let Some(app) = app.as_ref() {
+                    use tauri::Emitter;
+                    let _ = app.emit("veronica:error", format!("Voice output failed: {err}"));
+                }
+                speaking_for_error.set_session_open(false);
+            };
+            match FluxSession::start(on_audio, on_error) {
+                Ok(session) => {
+                    *guard = Some(session);
+                }
+                Err(err) => {
+                    log::warn!("Deepgram Flux TTS unavailable for this answer: {err}");
+                    if let Some(app) = self.app.as_ref() {
                         use tauri::Emitter;
                         let _ = app.emit("veronica:error", format!("Voice output failed: {err}"));
                     }
+                    return;
                 }
-                // Always sent, success or failure, unless the whole session
-                // was stopped: marks this seq complete so the player can
-                // advance to the next sentence. A failed/empty sentence
-                // still needs this — otherwise the player would wait
-                // forever for a seq that will never send real audio,
-                // silently stalling every sentence queued after it.
-                if !stopped.load(Ordering::SeqCst) {
-                    player.enqueue(seq, Vec::new(), true);
-                }
-                speaking.on_sentence_finished();
-            })
-            .ok();
+            }
+        }
+        if let Some(session) = guard.as_ref() {
+            session.speak(text);
+        }
     }
 
-    /// Stops playback immediately and prevents any in-flight `speak()` calls
-    /// from queuing further audio — used when a new question arrives while
-    /// this answer is still being spoken.
+    /// Marks the end of this answer's text — call once after the LLM
+    /// stream ends (and any trailing chunk has been sent via `speak()`), so
+    /// Flux knows to finalize the turn. A no-op if `speak()` was never
+    /// called (nothing was ever spoken, so there's no session to flush).
+    /// Deliberately does not close/clear the underlying connection — see
+    /// this module's doc: the same `FluxSession` is reused by the next
+    /// turn's `speak()` call whenever the server has kept it open.
+    pub fn finish(&self) {
+        if let Some(session) = self.flux.lock().unwrap().as_ref() {
+            session.flush();
+        }
+        self.speaking.set_session_open(false);
+    }
+
+    /// Resets this session for a new turn — call once at the start of every
+    /// new answer (fast-router confirmation or agent-loop response), before
+    /// any `speak()`/`speak_now()` for it. Required now that `TtsSession` is
+    /// a persistent, cross-turn object (see the module doc) rather than a
+    /// fresh one per answer: without this, a `stop()` from an earlier turn's
+    /// barge-in would leave `stopped` permanently set and silently suppress
+    /// every later turn's speech too.
+    pub fn begin_turn(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
+        // Clears any hook a turn set but never actually triggered (e.g. a
+        // turn that decided not to speak after all) — otherwise it would
+        // incorrectly fire on some LATER turn's first chunk instead of
+        // never firing at all.
+        self.on_first_audio_this_turn.lock().unwrap().take();
+    }
+
+    /// Speaks `text` immediately and finalizes the turn in one call — for
+    /// short, already-complete responses (a fast-router confirmation like
+    /// "Opening VS Code.", or a short final answer) that have no reason to
+    /// go through `SentenceChunker`'s sentence-boundary buffering. Skips the
+    /// chunker's punctuation-boundary wait entirely, so a short response
+    /// with no trailing punctuation is still guaranteed to be spoken (see
+    /// the audit finding this fixes: a chunk that never hits a sentence
+    /// boundary was previously never released to `speak()` at all).
+    pub fn speak_now(&self, text: &str) {
+        self.speak(text);
+        self.finish();
+    }
+
+    /// Stops playback immediately and cancels any in-flight Flux
+    /// synthesis — used when a new question arrives while this answer is
+    /// still being spoken (barge-in).
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        if let Some(session) = self.flux.lock().unwrap().take() {
+            session.interrupt();
+        }
         self.player.stop();
-        // Forced rather than waiting for in-flight request threads to reach
-        // their own on_sentence_finished(): stop() must unmute the mic
-        // immediately (the user is about to speak their next question), not
-        // whenever an already-abandoned Deepgram request happens to notice
-        // `stopped` and unwind — that could be seconds away on a slow
-        // connection.
+        // Forced rather than waiting for the Flux session to reach its own
+        // close: stop() must unmute the mic immediately (the user is about
+        // to speak their next question), not whenever an already-abandoned
+        // session happens to notice `stopped` and unwind — that could be
+        // seconds away on a slow connection.
         self.speaking.force_clear();
     }
 }
@@ -221,8 +314,26 @@ mod tests {
     fn session_starts_and_stops_without_panicking() {
         let speaking = TtsSpeakingSignal::default();
         let session = TtsSession::start(speaking, None).expect("failed to start session on a machine with real audio");
-        session.speak("this will fail without a real DEEPGRAM_API_KEY, which is fine for this test");
+        session.speak("this will fail without a real Deepgram API key, which is fine for this test");
         session.stop();
+    }
+
+    #[test]
+    #[ignore = "requires a real audio output device — not available in a sandboxed/headless test runner"]
+    fn stop_does_not_permanently_silence_a_later_turn_once_begin_turn_is_called() {
+        // Regression test for the persistent-session bug: `stopped` used to
+        // be a one-way flag, correct only when a fresh `TtsSession` was
+        // created per answer. Now that one `TtsSession` spans many turns
+        // (barge-in on turn 1 must not silence turn 2), `begin_turn()` must
+        // reset it.
+        let speaking = TtsSpeakingSignal::default();
+        let session = TtsSession::start(speaking, None).expect("failed to start session on a machine with real audio");
+        session.begin_turn();
+        session.speak("turn one");
+        session.stop(); // barge-in
+        session.begin_turn(); // next turn starts
+        session.speak("turn two — must not be silently suppressed");
+        session.finish();
     }
 
     #[test]
@@ -232,18 +343,18 @@ mod tests {
     }
 
     #[test]
-    fn speaking_signal_true_while_a_sentence_is_pending() {
+    fn speaking_signal_true_while_session_is_open() {
         let signal = TtsSpeakingSignal::default();
-        signal.on_sentence_started();
+        signal.set_session_open(true);
         assert!(signal.is_speaking());
-        signal.on_sentence_finished();
+        signal.set_session_open(false);
         assert!(!signal.is_speaking());
     }
 
     #[test]
-    fn speaking_signal_true_while_sink_is_active_even_with_no_pending_sentences() {
-        // Models the case every `speak()` call has already returned, but
-        // the player's sink is still playing the last sentence's audio.
+    fn speaking_signal_true_while_sink_is_active_even_with_session_closed() {
+        // Models the case the Flux session has already been flushed/closed,
+        // but the player's sink is still playing the last sentence's audio.
         let signal = TtsSpeakingSignal::default();
         signal.set_sink_active(true);
         assert!(signal.is_speaking());
@@ -254,11 +365,11 @@ mod tests {
     #[test]
     fn speaking_signal_true_if_either_condition_holds() {
         let signal = TtsSpeakingSignal::default();
-        signal.on_sentence_started();
+        signal.set_session_open(true);
         signal.set_sink_active(true);
         assert!(signal.is_speaking());
 
-        signal.on_sentence_finished();
+        signal.set_session_open(false);
         assert!(signal.is_speaking(), "sink still active, must stay true");
 
         signal.set_sink_active(false);
@@ -268,8 +379,7 @@ mod tests {
     #[test]
     fn force_clear_resets_both_conditions() {
         let signal = TtsSpeakingSignal::default();
-        signal.on_sentence_started();
-        signal.on_sentence_started();
+        signal.set_session_open(true);
         signal.set_sink_active(true);
         signal.force_clear();
         assert!(!signal.is_speaking());

@@ -46,7 +46,20 @@ windows = { version = "0.61", features = [
     "Win32_System_Power",
     "Win32_System_SystemInformation",
     "Win32_Security",
+    # Fast-router native actions added for the low-latency re-architecture
+    # (src/actions/native.rs): window enumeration/focus/minimize/maximize
+    # for WindowOp, Core Audio for VolumeOp, clipboard for ClipboardOp, and
+    # GDI for the CaptureScreen agent-loop tool.
+    "Win32_System_Threading",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_Graphics_Gdi",
 ] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
 sysinfo = "0.32"
 tauri-plugin-global-shortcut = "2.3.2"
 keyring = { version = "3", features = ["windows-native"] }
@@ -67,10 +80,21 @@ tokio = { version = "1", features = ["time"] }
 # service's per-launch internal auth token (see src/rag/process.rs). Adds no
 # new crate to the dependency tree.
 ring = "0.17"
-# Deepgram TTS playback (src/tts/player.rs) — plays raw linear16 PCM chunks
-# on the default output device as they stream in from Deepgram, so speech
-# starts on the first chunk instead of waiting for the whole utterance to
-# synthesize. Pulls in `cpal` transitively for the actual device I/O,
-# mirroring how `wasapi` already handles capture-side device I/O in src/audio/.
+# Deepgram Flux TTS playback (src/tts/player.rs) — plays raw linear16 PCM
+# chunks on the default output device as they stream in over the Flux
+# WebSocket, so speech starts on the first chunk instead of waiting for the
+# whole utterance to synthesize. Pulls in `cpal` transitively for the actual
+# device I/O, mirroring how `wasapi` already handles capture-side device I/O
+# in src/audio/.
 rodio = { version = "0.20", default-features = false }
+# Deepgram Flux TTS (src/tts/deepgram_flux.rs) talks a persistent
+# `wss://` WebSocket session, not plain HTTP — `tungstenite`'s blocking
+# client (not `tokio-tungstenite`) matches every other network call in this
+# crate (reqwest::blocking, Groq STT) which all run on a dedicated
+# std::thread rather than through the async runtime, so a sync client avoids
+# threading a tokio reactor through code that's synchronous everywhere else.
+# `rustls-tls-webpki-roots` reuses the same rustls stack already installed
+# process-wide (see src/tls_init.rs) instead of pulling in native-tls/OpenSSL.
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+http = "1.5.0"
 

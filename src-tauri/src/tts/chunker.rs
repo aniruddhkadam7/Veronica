@@ -5,7 +5,7 @@
 //! Waiting for the whole answer would mean no speech starts until the LLM
 //! is completely done, defeating the point of streaming. This buffers
 //! deltas and releases one chunk per completed sentence, so the first
-//! sentence can be sent to Deepgram (and start playing) while the LLM is
+//! sentence can be sent to Deepgram Flux (and start playing) while the LLM is
 //! still generating the rest of the answer.
 
 pub struct SentenceChunker {
@@ -122,7 +122,7 @@ fn find_sentence_boundary(buffer: &str) -> Option<usize> {
 /// slightly more fragmented than a full sentence would.
 ///
 /// Requires at least `MIN_SOFT_CHUNK_CHARS` before considering a comma a
-/// boundary, so "Well, " or "So, " doesn't get sent to Deepgram as its own
+/// boundary, so "Well, " or "So, " doesn't get sent to Deepgram Flux as its own
 /// one-word utterance — that would be slower overall (fixed per-request
 /// latency paid twice) and sound worse, not better.
 fn find_soft_boundary(buffer: &str) -> Option<usize> {

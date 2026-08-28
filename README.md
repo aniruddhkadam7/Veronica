@@ -16,12 +16,15 @@ can be built and modified on its own.
   sherpa-onnx engine still runs alongside it purely to detect when you've
   stopped speaking (voice-activity/endpoint detection); it never produces
   transcript text itself, only decides which span of audio to send to Groq.
-- Text-to-speech via Deepgram Cloud's Aura-1 (`aura-asteria-en`) — requires a
-  Deepgram API key (Settings -> API Keys) and network access, opt-in via the
-  overlay's "Speak answers aloud" toggle. Streams audio as it's synthesized
-  so playback starts on the first chunk, not after the whole answer
-  finishes. No local TTS exists and there is no fallback if Deepgram is
-  unreachable — that sentence just isn't spoken.
+- Text-to-speech via Deepgram Flux (`flux-sienna-en`), streamed over a
+  persistent `wss://` session — requires a Deepgram API key (Settings ->
+  API Keys) and network access, opt-in via the overlay's "Speak answers
+  aloud" toggle. Text streams into the session sentence-by-sentence as the
+  LLM answer arrives and audio streams back the same way, so playback
+  starts on the first chunk, not after the whole answer finishes. A new
+  question or the user speaking again interrupts (barges in on) whatever
+  is still being spoken. No local TTS exists and there is no fallback if
+  Deepgram is unreachable — that sentence just isn't spoken.
 - Local document search/RAG (bundled, offline, no cloud dependency).
 - Every API key — your AI provider (OpenAI/Anthropic/Gemini), Groq, and
   Deepgram — is entered in Settings -> API Keys and stored in Windows
@@ -37,7 +40,7 @@ Smallbird Local (this repo)
         +-- Tauri Desktop App (src/, src-tauri/)
         +-- STT: local VAD/endpoint detection (sidecars/stt-sidecar/, models/stt/)
         |         + Groq Cloud transcription (src-tauri/src/stt/groq.rs)
-        +-- TTS: Deepgram Cloud Aura-1 (src-tauri/src/tts/) -- opt-in, no local model
+        +-- TTS: Deepgram Flux, streamed over wss:// (src-tauri/src/tts/) -- opt-in, no local model
         +-- Local RAG / document search (sidecars/rag-lite/)
         +-- Direct AI provider client (src-tauri/src/personal/)
         +-- Your API keys, all of them (Windows Credential Manager, via Settings -> API Keys)
@@ -112,15 +115,16 @@ self-contained PyInstaller-frozen sidecar instead (see
 
 Get a Groq key at [console.groq.com](https://console.groq.com) (speech-to-text)
 and a Deepgram key at [console.deepgram.com](https://console.deepgram.com)
-(text-to-speech). Both are entered the same way as your LLM provider key —
-launch the app, open Settings -> API Keys, and paste each in under the
-"Voice" section. Stored in Windows Credential Manager, not an env var or file.
+(text-to-speech, used for Flux). Both are entered the same way as your LLM
+provider key — launch the app, open Settings -> API Keys, and paste each in
+under the "Voice" section. Stored in Windows Credential Manager, not an env
+var or file.
 
 Without a Groq key configured, voice input will not produce any transcript
 text — every detected utterance is dropped and a warning is logged (see
 `src-tauri/src/stt/groq.rs`). Without a Deepgram key, enabling the overlay's
-"Speak answers aloud" toggle just means no audio plays, warning logged per
-sentence (see `src-tauri/src/tts/deepgram.rs`). Either way, everything else
+"Speak answers aloud" toggle just means no audio plays, warning logged
+(see `src-tauri/src/tts/deepgram_flux.rs`). Either way, everything else
 in the app (text chat, Notes, RAG search) works normally regardless.
 
 ## Development

@@ -46,21 +46,21 @@ pub fn show_overlay_window(app: &AppHandle, label: &str, title: &str) -> Result<
         center_overlay_on_screen(&existing, false);
         existing.show().map_err(|e| e.to_string())?;
         existing.set_focus().map_err(|e| e.to_string())?;
-        windows_capture_protection::enable_capture_exclusion(&existing).is_ok()
+        // Screen-capture exclusion is currently disabled — the overlay
+        // should stay visible in screen shares/recordings rather than being
+        // hidden from them.
+        let _ = windows_capture_protection::disable_capture_exclusion(&existing);
+        false
     } else {
         let window = build_overlay_window(app, label, title)?;
         center_overlay_on_screen(&window, true);
 
-        let excluded = windows_capture_protection::enable_capture_exclusion(&window).is_ok();
-        if excluded {
-            log::info!("overlay '{label}': screen-capture exclusion ENABLED");
-        } else {
-            log::warn!("overlay '{label}': screen-capture exclusion FAILED/UNAVAILABLE");
-        }
+        let _ = windows_capture_protection::disable_capture_exclusion(&window);
+        log::info!("overlay '{label}': screen-capture exclusion disabled (visible in screen share)");
 
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
-        excluded
+        false
     };
 
     if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {

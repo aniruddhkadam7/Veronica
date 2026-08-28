@@ -17,6 +17,27 @@
 use std::io::Write as _;
 use std::time::Duration;
 
+/// Below this RMS (0.0-1.0, see `audio::compute_rms`), an utterance is
+/// treated as near-silence/room noise and never sent to Groq at all — the
+/// cheapest possible guard against Whisper-family models' well-documented
+/// tendency to *hallucinate* plausible-sounding text (often a short stock
+/// phrase in an unexpected language) when given silence or noise instead of
+/// real speech, rather than reporting "no speech". This only catches the
+/// obvious case (near-total silence); see `is_likely_hallucination` below
+/// for the case where the local VAD still triggered on something with real
+/// energy (a click, a cough, faint background sound) that isn't speech.
+const MIN_SPEECH_RMS: f32 = 0.006;
+
+/// Standard Whisper hallucination heuristic (the same one whisper.cpp/
+/// faster-whisper use): a segment Whisper itself is unsure contains speech
+/// at all reports a high `no_speech_prob` and/or a very negative
+/// `avg_logprob` (low confidence in its own token choices) — exactly the
+/// signature of "there was no real speech here, but the model still had to
+/// emit *something*." Thresholds are the commonly-used defaults for this
+/// exact check, not tuned against this app's own data.
+const NO_SPEECH_PROB_THRESHOLD: f64 = 0.6;
+const AVG_LOGPROB_THRESHOLD: f64 = -1.0;
+
 const TRANSCRIPTIONS_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 const MODEL: &str = "whisper-large-v3-turbo";
 
@@ -86,27 +107,48 @@ pub fn transcribe(samples: &[f32], sample_rate: u32) -> Result<String, GroqError
     if samples.is_empty() {
         return Ok(String::new());
     }
+    // Near-silence/room-noise guard — see `MIN_SPEECH_RMS`'s doc. Cheaper
+    // than a network call, and the local VAD's own endpoint detection can
+    // still trigger on non-speech energy (a click, a chair creak) even with
+    // its speech pre-gate disabled (see `stt::sidecar`'s doc on
+    // `STT_VAD_GATE_ENABLED`), so this is a real, needed second check, not
+    // a redundant one.
+    if crate::audio::compute_rms(samples) < MIN_SPEECH_RMS {
+        return Ok(String::new());
+    }
     let key = api_key()?;
 
     let wav_bytes = encode_wav_pcm16(samples, sample_rate);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(request_timeout())
-        .build()
-        .map_err(|e| GroqError::Network(e.to_string()))?;
+    // Shared, process-wide client (see `http_client`) instead of a fresh one
+    // per utterance — keeps the TCP/TLS connection to Groq warm across
+    // consecutive utterances in the same session rather than paying a full
+    // handshake every time. The per-call timeout still applies, via the
+    // request builder rather than the client itself, so `GROQ_TIMEOUT_MS`
+    // stays live-tunable exactly as before.
+    let client = crate::http_client::shared_blocking_client();
 
     let part = reqwest::blocking::multipart::Part::bytes(wav_bytes)
         .file_name("segment.wav")
         .mime_str("audio/wav")
         .map_err(|e| GroqError::Network(e.to_string()))?;
+    // "verbose_json" (not "json") specifically to get each segment's
+    // `no_speech_prob`/`avg_logprob` back — see `is_likely_hallucination`.
+    // The plain "json" format only ever returns `text`, with no way to tell
+    // "real speech, confidently transcribed" apart from "no real speech,
+    // but the model emitted a plausible-looking phrase anyway" (this app's
+    // exact live-observed failure: a short foreign-language phrase
+    // transcribed from silence/noise and then acted on as if the user had
+    // said it).
     let form = reqwest::blocking::multipart::Form::new()
         .text("model", MODEL)
-        .text("response_format", "json")
+        .text("response_format", "verbose_json")
         .part("file", part);
 
     let response = client
         .post(TRANSCRIPTIONS_URL)
         .bearer_auth(&key)
+        .timeout(request_timeout())
         .multipart(form)
         .send()
         .map_err(|e| {
@@ -129,7 +171,35 @@ pub fn transcribe(samples: &[f32], sample_rate: u32) -> Result<String, GroqError
     let json: serde_json::Value = response
         .json()
         .map_err(|e| GroqError::UnexpectedResponse(e.to_string()))?;
-    Ok(json.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string())
+    let text = json.get("text").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        return Ok(text);
+    }
+    if is_likely_hallucination(&json) {
+        log::info!("Groq: discarding likely hallucinated transcript (low speech confidence): {text:?}");
+        return Ok(String::new());
+    }
+    Ok(text)
+}
+
+/// Applies the standard Whisper hallucination heuristic (see
+/// `NO_SPEECH_PROB_THRESHOLD`/`AVG_LOGPROB_THRESHOLD`'s doc) across every
+/// segment in a `verbose_json` response. `false` (never filtered) if the
+/// response has no `segments` array at all — an unexpected shape must fail
+/// open to "trust the text", not silently start dropping every real
+/// transcript.
+fn is_likely_hallucination(response: &serde_json::Value) -> bool {
+    let Some(segments) = response.get("segments").and_then(|s| s.as_array()) else {
+        return false;
+    };
+    if segments.is_empty() {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        let no_speech_prob = segment.get("no_speech_prob").and_then(|v| v.as_f64());
+        let avg_logprob = segment.get("avg_logprob").and_then(|v| v.as_f64());
+        no_speech_prob.is_some_and(|p| p >= NO_SPEECH_PROB_THRESHOLD) || avg_logprob.is_some_and(|p| p <= AVG_LOGPROB_THRESHOLD)
+    })
 }
 
 /// Encodes f32 samples (-1.0..1.0) as a minimal mono 16-bit PCM WAV file in
@@ -207,5 +277,70 @@ mod tests {
     fn display_never_includes_a_key_value() {
         let err = GroqError::MissingKey;
         assert!(!err.to_string().to_lowercase().contains("gsk_"));
+    }
+
+    // -- is_likely_hallucination: the live-observed bug this guards against
+    // (a short foreign-language phrase transcribed from silence/noise and
+    // then acted on as if the user had said it) --
+
+    #[test]
+    fn high_no_speech_prob_is_flagged_as_hallucination() {
+        let response = serde_json::json!({
+            "text": "그럴까?",
+            "segments": [{"no_speech_prob": 0.85, "avg_logprob": -0.3}],
+        });
+        assert!(is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn very_negative_avg_logprob_is_flagged_as_hallucination() {
+        let response = serde_json::json!({
+            "text": "some garbled text",
+            "segments": [{"no_speech_prob": 0.1, "avg_logprob": -1.5}],
+        });
+        assert!(is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn confident_real_speech_is_not_flagged() {
+        let response = serde_json::json!({
+            "text": "Open VS Code.",
+            "segments": [{"no_speech_prob": 0.02, "avg_logprob": -0.15}],
+        });
+        assert!(!is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn one_confident_segment_among_several_is_enough_to_trust_the_transcript() {
+        // A multi-segment utterance where only PART of it looks like real
+        // speech must not be discarded wholesale.
+        let response = serde_json::json!({
+            "text": "Open VS Code.",
+            "segments": [
+                {"no_speech_prob": 0.9, "avg_logprob": -0.2},
+                {"no_speech_prob": 0.02, "avg_logprob": -0.1},
+            ],
+        });
+        assert!(!is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn missing_segments_array_fails_open_never_filters() {
+        let response = serde_json::json!({"text": "some text"});
+        assert!(!is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn empty_segments_array_fails_open() {
+        let response = serde_json::json!({"text": "", "segments": []});
+        assert!(!is_likely_hallucination(&response));
+    }
+
+    #[test]
+    fn near_silence_never_reaches_the_network() {
+        // RMS well below MIN_SPEECH_RMS — must short-circuit to empty text
+        // exactly like the empty-samples case, regardless of key state.
+        let quiet = vec![0.0001f32; 16_000];
+        assert_eq!(transcribe(&quiet, 16_000).unwrap(), "");
     }
 }

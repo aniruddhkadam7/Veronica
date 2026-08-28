@@ -1,4 +1,8 @@
-mod actions;
+// pub(crate) (not private) so `personal::agent`'s tool loop can reach
+// `Capability`/`execute_tool`/`fast_router` without a re-export chain —
+// still invisible outside this crate (the `bin/*.rs` diagnostic binaries
+// depend on `desktop_lib` as an external crate and have no need for it).
+pub(crate) mod actions;
 mod analyzer;
 // Public so the `audio_probe` binary (src/bin/audio_probe.rs) can drive the
 // real capture path when measuring the pipeline, rather than a copy of it that
@@ -6,6 +10,7 @@ mod analyzer;
 pub mod audio;
 mod backend;
 mod commands;
+mod http_client;
 // Public so the RAG/STT spawn call sites and the `rag-bench`/`stt-bench`
 // verification steps (Milestone 4a) can reference `PerformanceConfig`
 // without a re-export chain.
@@ -23,6 +28,7 @@ mod veronica;
 mod veronica_widget;
 mod veronica_window;
 mod voice_command;
+mod working_state;
 // Public alongside `audio` so `src/bin/pipeline_test.rs` can drive the real
 // recording pipeline headlessly instead of a reimplementation of it.
 pub mod stt;
@@ -222,6 +228,7 @@ pub fn run() {
             veronica::speak_greeting,
             veronica_widget::show_veronica_widget,
             veronica_widget::hide_veronica_widget,
+            veronica_widget::resize_veronica_widget,
             notes_mode::store::list_notes,
             notes_mode::store::get_note,
             notes_mode::store::create_note,

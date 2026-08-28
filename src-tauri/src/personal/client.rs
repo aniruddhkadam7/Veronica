@@ -82,6 +82,13 @@ impl DirectLlmClient {
         Ok(AskResponse { answer: answer.trim().to_string(), latency_ms: 0.0 })
     }
 
+    // Superseded by `agentic_provider()` + `personal::agent::run_agent_loop`
+    // (see `veronica::ask_veronica`), which replaced the single-shot
+    // ACTION-line ask path this backed. Kept, like `ask()` above, rather
+    // than deleted — still correct, still tested, and `AskRequest`/
+    // `build_messages` remain real, valid types/functions this crate uses
+    // elsewhere (not dead in themselves, only this one call site is).
+    #[allow(dead_code)]
     pub async fn ask_stream<F>(&self, request: &AskRequest, mut on_delta: F) -> Result<String, String>
     where
         F: FnMut(&str),
@@ -95,6 +102,22 @@ impl DirectLlmClient {
         })
         .await?;
         Ok(full_answer)
+    }
+
+    /// Builds the tool-calling `AgenticProvider` for whichever provider this
+    /// client is configured for — what `veronica::ask_veronica` hands to
+    /// `personal::agent::run_agent_loop` for anything the fast router
+    /// doesn't handle deterministically. A boxed trait object (not an enum
+    /// match at each call site) since the three providers' agent structs
+    /// have no shared concrete type — `run_agent_loop` only ever needs
+    /// `&dyn AgenticProvider`, never to know which one it got.
+    pub fn agentic_provider(&self) -> Box<dyn crate::personal::agent::AgenticProvider> {
+        let model = default_model(self.provider).to_string();
+        match self.provider {
+            LlmProvider::OpenAi => Box::new(super::providers::openai::OpenAiAgent { api_key: self.api_key.clone(), model }),
+            LlmProvider::Anthropic => Box::new(super::providers::anthropic::AnthropicAgent { api_key: self.api_key.clone(), model }),
+            LlmProvider::Gemini => Box::new(super::providers::gemini::GeminiAgent { api_key: self.api_key.clone(), model }),
+        }
     }
 
     // ---- Interview analysis ----

@@ -156,6 +156,159 @@ pub fn open_path_or_url(target: &str) -> Result<String, String> {
     }
 }
 
+// ---------------------------------------------------------------------
+// Fast-router native actions (window ops, CPU/memory, volume, clipboard,
+// screen capture) — added for the low-latency re-architecture. Same
+// conventions as the block above: `Result<_, String>`, native Win32/OS
+// calls only, no shelling out.
+// ---------------------------------------------------------------------
+
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, ShowWindow, EnumWindows, SM_CXSCREEN, SM_CYSCREEN, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
+};
+
+/// Finds the first visible top-level window whose title contains `needle`
+/// (case-insensitive) — the same "substring match" spirit as
+/// `resolve_app_path`'s Start Menu shortcut scan above, not exact-title
+/// matching (voice input is never going to say a window's exact title).
+fn find_window_by_title(needle: &str) -> Option<HWND> {
+    struct SearchCtx {
+        needle: String,
+        found: Option<isize>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut SearchCtx);
+        if IsWindowVisible(hwnd).as_bool() {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut buf = vec![0u16; len as usize + 1];
+                let read = GetWindowTextW(hwnd, &mut buf);
+                if read > 0 {
+                    let title = String::from_utf16_lossy(&buf[..read as usize]).to_lowercase();
+                    if title.contains(&ctx.needle) {
+                        ctx.found = Some(hwnd.0 as isize);
+                        return BOOL(0);
+                    }
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = SearchCtx { needle: needle.to_lowercase(), found: None };
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut SearchCtx as isize));
+    }
+    ctx.found.map(|raw| HWND(raw as *mut _))
+}
+
+/// Resolves a window operation's target: the named window if given, else
+/// whatever window currently has focus — "minimize this"/"close this" with
+/// no explicit app name is a normal thing to say.
+fn resolve_target_window(target: Option<&str>) -> Result<HWND, String> {
+    match target {
+        Some(name) => find_window_by_title(name).ok_or_else(|| format!("I couldn't find a window matching \"{name}\".")),
+        None => {
+            let hwnd = unsafe { GetForegroundWindow() };
+            if hwnd.0.is_null() {
+                Err("there's no focused window right now".to_string())
+            } else {
+                Ok(hwnd)
+            }
+        }
+    }
+}
+
+/// Focuses an already-running window matching `name` if one exists,
+/// otherwise launches it fresh via `resolve_and_launch_app`. This is what
+/// `Capability::LaunchOrFocusApp` (the fast router's target for "open"/
+/// "launch"/"start") actually runs — checking for an already-open window
+/// first both avoids spawning a duplicate instance of apps that support only
+/// one, and is the lower-latency path when the app is already running (no
+/// process spawn/startup at all, just a foreground-window switch).
+pub fn launch_or_focus_app(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("no app name given".into());
+    }
+    if let Some(hwnd) = find_window_by_title(trimmed) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        return Ok(format!("{trimmed} is already open."));
+    }
+    resolve_and_launch_app(trimmed)
+}
+
+pub fn window_minimize(target: Option<&str>) -> Result<String, String> {
+    let hwnd = resolve_target_window(target)?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    }
+    Ok("Minimized.".to_string())
+}
+
+pub fn window_maximize(target: Option<&str>) -> Result<String, String> {
+    let hwnd = resolve_target_window(target)?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+    }
+    Ok("Maximized.".to_string())
+}
+
+pub fn window_close(target: Option<&str>) -> Result<String, String> {
+    let hwnd = resolve_target_window(target)?;
+    unsafe {
+        // WM_CLOSE (a polite close request the app can intercept, e.g. to
+        // prompt "save changes?") rather than force-terminating the process.
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    Ok("Closed.".to_string())
+}
+
+pub fn window_focus(target: Option<&str>) -> Result<String, String> {
+    let hwnd = resolve_target_window(target)?;
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    Ok("Done.".to_string())
+}
+
+/// CPU usage via `sysinfo` — same pattern already used by
+/// `hardware::profile`'s hardware-detection pass (two `refresh_cpu_usage()`
+/// calls separated by `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`; sysinfo's CPU
+/// percentage is delta-based and reads as 0 without a real interval between
+/// samples — not an artificial delay, a real OS measurement requirement).
+pub fn query_cpu_usage() -> Result<String, String> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_usage();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_cpu_usage();
+    let pct = sys.global_cpu_usage();
+    Ok(format!("CPU usage is {pct:.0} percent."))
+}
+
+pub fn query_memory_usage() -> Result<String, String> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let used = sys.used_memory();
+    let total = sys.total_memory();
+    let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+    let used_gb = used as f64 / 1_073_741_824.0;
+    let total_gb = total as f64 / 1_073_741_824.0;
+    Ok(format!("Memory usage is {pct:.0} percent — {used_gb:.1} of {total_gb:.1} gigabytes."))
+}
+
+pub fn screen_width_height() -> (i32, i32) {
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
 /// Answers a small fixed set of system-info questions directly via native
 /// APIs — no shelling out to `wmic`/PowerShell for these.
 pub fn query_system_info(kind: &str) -> Result<String, String> {

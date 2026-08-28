@@ -21,6 +21,12 @@ export interface OrbProps {
   state?: OrbState;
   size?: number;
   speed?: number;
+  /// Multiplier on how far the particles actually move (ripple/pulse/jitter
+  /// amplitude and level-driven radius swing) — independent of `speed`,
+  /// which only controls how fast the existing motion cycles. 1 = default
+  /// tuning; >1 makes each state's motion visually bigger without changing
+  /// its rhythm.
+  intensity?: number;
   colorFrom?: string;
   colorTo?: string;
   levelRef?: RefObject<number>;
@@ -63,15 +69,15 @@ export const stateMotion = (state: OrbState): OrbMotion => {
 export const stateEnergy = (state: OrbState, t: number): number => {
   switch (state) {
     case 'listening':
-      return 0.4 + 0.32 * Math.abs(Math.sin(t * 8.5)) + 0.18 * Math.abs(Math.sin(t * 4.1 + 1.5));
+      return 0.55 + 0.5 * Math.abs(Math.sin(t * 8.5)) + 0.3 * Math.abs(Math.sin(t * 4.1 + 1.5));
     case 'speaking':
-      return 0.3 + 0.24 * Math.abs(Math.sin(t * 6.2)) + 0.16 * Math.abs(Math.sin(t * 3 + 0.6));
+      return 0.45 + 0.4 * Math.abs(Math.sin(t * 6.2)) + 0.28 * Math.abs(Math.sin(t * 3 + 0.6));
     case 'thinking':
-      return 0.24 + 0.2 * Math.abs(Math.sin(t * 2.4));
+      return 0.36 + 0.34 * Math.abs(Math.sin(t * 2.4));
     case 'connecting':
-      return 0.12 + 0.1 * Math.abs(Math.sin(t * 1.6));
+      return 0.18 + 0.16 * Math.abs(Math.sin(t * 1.6));
     case 'error':
-      return 0.2;
+      return 0.3;
     default:
       return 0;
   }

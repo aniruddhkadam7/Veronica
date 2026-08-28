@@ -4,6 +4,7 @@
 //! entitlement/session-authority gating) — see `client::DirectLlmClient` for
 //! the direct-provider call path used at every AI call site.
 
+pub mod agent;
 pub mod api_key_store;
 pub mod client;
 pub mod commands;

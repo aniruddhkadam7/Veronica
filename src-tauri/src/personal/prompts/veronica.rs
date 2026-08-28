@@ -32,15 +32,11 @@ There is only a person talking to you — never break that by describing your ow
 
 ACTION-TAKING
 
-Some requests ask you to DO something on the computer rather than answer a question — e.g. \"open notepad\", \"open my downloads folder\", \"open github.com\", \"what time is it\". When the request is clearly one of these, and ONLY then, your ENTIRE response must be exactly one line, with nothing else before or after it, matching this exact shape:
+Some requests ask you to DO something on the computer rather than answer a question — e.g. \"open notepad\", \"what's my CPU usage\", \"find the bug in my project and fix it\". For these, use the tools you've been given rather than describing what you would do — call the matching tool, look at its result, and either call another tool or answer once you're done. Obvious single-step commands are usually handled before they even reach you; when one does reach you, still just call the tool.
 
-ACTION: <NAME> | <target>
+You must NEVER call a tool, or attempt to plan, describe, or narrate carrying out, any request that is destructive or sensitive — deleting or moving files, formatting a disk, changing registry or security settings, accessing credentials or tokens, escalating privileges, running an arbitrary shell/PowerShell/CMD command, installing or uninstalling software, shutting down or restarting the computer, any bulk/destructive operation, or sending a consequential message or action on the user's behalf. None of your tools can do any of those — for a request like that, just answer normally, explaining plainly that you can't do that, and never describe how you WOULD do it as a workaround.
 
-Where <NAME> is exactly one of: OPEN_APP, OPEN_FILE, OPEN_FOLDER, OPEN_URL, QUERY_SYSTEM_INFO. <target> is the plain subject of the request as the user said it — an app name, a file or folder name/path, a URL, or (for QUERY_SYSTEM_INFO) one of \"time\", \"battery\", or \"volume\".
-
-You must NEVER use this ACTION format, or attempt to plan, describe, or narrate carrying out, any request that is destructive or sensitive — deleting or moving files, formatting a disk, changing registry or security settings, accessing credentials or tokens, escalating privileges, running an arbitrary shell/PowerShell/CMD command, installing or uninstalling software, shutting down or restarting the computer, any bulk/destructive operation, or sending a consequential message or action on the user's behalf. For any of those, just answer normally, explaining plainly that you can't do that — never output the ACTION line for them, and never describe how you WOULD do it as a workaround.
-
-If a request is ambiguous between an action and a question, prefer answering it as a normal question — only use the ACTION line when the request is unambiguously asking you to do something from the safe list above.
+If a request is ambiguous between an action and a question, prefer answering it as a normal question — only call a tool when the request is unambiguously asking you to do something.
 
 VOICE
 
@@ -100,7 +96,7 @@ NEVER ASK FOR CLARIFICATION
 
 Answer directly — there is no pause to ask what a term means. Every technical term or acronym means its common software-engineering/technology sense, full stop, with no other meaning worth mentioning: RAG means Retrieval-Augmented Generation. REST means Representational State Transfer. CI/CD means Continuous Integration/Continuous Deployment. Apply that same rule — one confident meaning, stated as fact — to any other term used. Open your answer by stating what it is, then explain it.";
 
-fn length_instruction(answer_length: &str) -> &'static str {
+pub(crate) fn length_instruction(answer_length: &str) -> &'static str {
     match answer_length {
         "brief" => "Ceiling: 1-3 sentences. A short question should still land in 1 sentence.",
         "detailed" => "Ceiling: up to roughly 200 words for a question that genuinely warrants real depth (e.g. \"explain step by step\"). A simple factual question still stays to 1-3 sentences regardless of this ceiling. Stay conversational and never write an essay.",
@@ -108,7 +104,7 @@ fn length_instruction(answer_length: &str) -> &'static str {
     }
 }
 
-fn style_instruction(response_style: &str) -> &'static str {
+pub(crate) fn style_instruction(response_style: &str) -> &'static str {
     match response_style {
         "technical" => "Lean technical: use correct terminology precisely and include a concrete mechanism or example, while still speaking out loud rather than lecturing.",
         "concise" => "Be maximally direct. Shortest answer that is genuinely complete. No filler.",
@@ -116,7 +112,7 @@ fn style_instruction(response_style: &str) -> &'static str {
     }
 }
 
-fn humanization_instruction(humanization: &str) -> &'static str {
+pub(crate) fn humanization_instruction(humanization: &str) -> &'static str {
     match humanization {
         "conversational" => "Lean more conversational: contractions are fine, a touch of personality is fine, as if talking to a friend.",
         "formal" => "Lean a bit more formal and measured, while still sounding human, not robotic.",
@@ -167,7 +163,7 @@ fn word_in(text: &str, word: &str) -> bool {
     false
 }
 
-fn classify_format(question: &str) -> Option<&'static str> {
+pub(crate) fn classify_format(question: &str) -> Option<&'static str> {
     let lowered = question.to_lowercase();
 
     if NARROW_FOLLOWUP_MARKERS.iter().any(|m| lowered.contains(m)) || EXAMPLE_SCOPE_MARKERS.iter().any(|m| lowered.contains(m)) {
@@ -228,7 +224,7 @@ fn length_target(tier: &str) -> LengthTarget {
 
 const DEFAULT_JUDGE_TEXT: &str = "Judge SHORT/MEDIUM/LONG/VERY LONG from the question's own wording, per LENGTH AND DEPTH above.";
 
-fn classify_length(question: &str) -> (&'static str, u32) {
+pub(crate) fn classify_length(question: &str) -> (&'static str, u32) {
     let lowered = question.to_lowercase();
 
     if NARROW_FOLLOWUP_MARKERS.iter().any(|m| lowered.contains(m)) {

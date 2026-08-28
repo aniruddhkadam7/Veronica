@@ -65,6 +65,7 @@ export const ParticlesOrb = ({
   state = 'idle',
   size = 168,
   speed = 1,
+  intensity = 1,
   colorFrom = '#f0abfc',
   colorTo = '#818cf8',
   levelRef,
@@ -76,6 +77,7 @@ export const ParticlesOrb = ({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const stateRef = useRef(state);
   const speedRef = useRef(speed);
+  const intensityRef = useRef(intensity);
   const colorRef = useRef({ from: colorFrom, to: colorTo });
   const drawStaticRef = useRef<(() => void) | null>(null);
 
@@ -94,6 +96,7 @@ export const ParticlesOrb = ({
   useEffect(() => {
     stateRef.current = state;
     speedRef.current = speed;
+    intensityRef.current = intensity;
     colorRef.current = { from: colorFrom, to: colorTo };
   });
 
@@ -129,6 +132,7 @@ export const ParticlesOrb = ({
     const render = (dt: number, isStatic = false) => {
       const st = stateRef.current;
       const spd = speedRef.current;
+      const amp = intensityRef.current;
       const easeDt = isStatic ? 60 : dt;
       const w = stateMix.update(st, easeDt);
 
@@ -150,17 +154,22 @@ export const ParticlesOrb = ({
       const rawLevel = isStatic
         ? stateEnergy(st, t)
         : clamp01(Number.parseFloat(getComputedStyle(host).getPropertyValue('--orb-level')) || 0);
-      levelS = approach(levelS, rawLevel, 9, easeDt);
+      levelS = approach(levelS, rawLevel, 14, easeDt);
       const level = levelS;
 
-      const spin = (0.14 + ripple * (0.9 + level * 1.6) + flow * 0.4 + wConn * 0.3) * motionScale;
+      const spin = (0.14 + ripple * (1.6 + level * 2.8) * amp + flow * 0.75 * amp + wConn * 0.3) * motionScale;
       angleY += dt * spd * spin;
       connectingPhase = (connectingPhase + dt * spd * 1.1) % TWO_PI;
 
-      const breathe = 0.05 * (0.25 + wIdle * 0.75) * Math.sin(t * 1.1 * spd) * motionScale;
-      const conv = pulse * (0.22 + 0.12 * Math.sin(t * 2.6 * spd + 1));
-      const expand = flow * (0.08 + level * 0.32);
-      const radius = baseRadius * (1 + breathe + level * 0.16 + expand - conv);
+      const breathe = 0.05 * (0.25 + wIdle * 0.75) * amp * Math.sin(t * 1.1 * spd) * motionScale;
+      const conv = pulse * (0.4 + 0.22 * Math.sin(t * 2.6 * spd + 1)) * amp;
+      const expand = flow * (0.16 + level * 0.6) * amp;
+      // Clamped so a high user-set intensity/speed can never grow the sphere
+      // past the canvas bounds — beyond that point particles wrap past the
+      // edges and the round silhouette reads as a filled square instead of a
+      // bounded orb.
+      const radiusMul = Math.min(1.55, 1 + breathe + level * 0.34 * amp + expand - conv);
+      const radius = baseRadius * radiusMul;
 
       const from = mixRgb(hexToRgb(colorRef.current.from), ERROR_FROM_RGB, wError);
       const to = mixRgb(hexToRgb(colorRef.current.to), ERROR_TO_RGB, wError);
@@ -169,10 +178,16 @@ export const ParticlesOrb = ({
       const shakeX = shakeAmp * (Math.sin(t * 26 * spd) + 0.5 * Math.sin(t * 15.7 * spd));
       const shakeY = shakeAmp * (Math.cos(t * 22.5 * spd) + 0.5 * Math.sin(t * 13.1 * spd));
 
-      const idleAmp = wIdle * radius * 0.055 * motionScale;
-      const jitterAmp = (flow + wError * 0.7) * radius * (0.015 + level * 0.085) * motionScale;
-      const rippleAmp = ripple * (0.045 + level * 0.24);
-      const pulseAmp = pulse * 0.16;
+      // Clamped (independent of the `radius` clamp above): these multiply
+      // `pointRadius`/offsets directly, so an uncapped `amp` at high
+      // ripple/level would still be able to push individual particles well
+      // outside the canvas — same square-silhouette failure mode as the
+      // radius clamp above guards against, just per-point instead of on the
+      // whole sphere.
+      const idleAmp = wIdle * radius * 0.055 * amp * motionScale;
+      const jitterAmp = (flow + wError * 0.7) * radius * Math.min(0.22, (0.03 + level * 0.18) * amp) * motionScale;
+      const rippleAmp = ripple * Math.min(0.6, (0.09 + level * 0.48) * amp);
+      const pulseAmp = pulse * Math.min(0.4, 0.32 * amp);
       const alphaScale = 1 - wDisabled * 0.35;
 
       const cosY = Math.cos(angleY);
@@ -307,7 +322,7 @@ export const ParticlesOrb = ({
 
   useEffect(() => {
     drawStaticRef.current?.();
-  }, [state, colorFrom, colorTo]);
+  }, [state, colorFrom, colorTo, intensity]);
 
   return (
     <div

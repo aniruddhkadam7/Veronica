@@ -13,12 +13,7 @@ import {
   type ResponseStyle,
 } from "./overlaySettings";
 import { OverlaySettingsPanel } from "./OverlaySettingsPanel";
-import {
-  AUTO_AI_SILENCE_MS_COMPLETE,
-  AUTO_AI_SILENCE_MS_INCOMPLETE,
-  classifyQuestionCompleteness,
-  joinSpeech,
-} from "./questionCompleteness";
+import { classifyQuestionCompleteness, joinSpeech, SAFETY_NET_MS } from "./questionCompleteness";
 import { AudioLevelBars, useSttSpeaking } from "./ui";
 import { ParticlesOrb } from "@/registry/orbe/particles-orb/particles-orb";
 import { loadLlmProvider } from "./llmProviderSetting";
@@ -61,9 +56,9 @@ const OPACITY_MAX = 1;
 /// linger once the user has clearly moved on to typing/talking.
 const WAKE_UP_GLOW_MS = 2500;
 
-// Auto AI silence-window constants, the completeness classifier, and
-// joinSpeech() now live in questionCompleteness.ts, shared with Custom
-// Agents' overlay so both Auto AI implementations behave identically.
+// The completeness classifier, joinSpeech(), and the bounded safety-net
+// constant live in questionCompleteness.ts, shared with Custom Agents'
+// overlay so both Auto AI implementations behave identically.
 
 export function VeronicaOverlay() {
   // The whole conversation, oldest first. Nothing is ever removed or replaced
@@ -124,11 +119,12 @@ export function VeronicaOverlay() {
   // otherwise. Answer deltas must keep landing regardless of re-renders.
   const busyRef = useRef(false);
   const hintTimerRef = useRef<number | null>(null);
-  // Debounce timer that fires askAI() once speech has stopped for
-  // AUTO_AI_SILENCE_MS — always active now (there is no manual toggle;
-  // talking to Veronica and pausing always sends). Lives in a ref (not
-  // state) since it's set/cleared from the transcript listener, which must
-  // not re-subscribe on every keystroke-equivalent state change.
+  // Safety-net timer: only armed when the buffered text still looks
+  // incomplete after a Final (see the transcript listener below) — a
+  // complete-looking Final sends immediately, with no timer at all. Lives
+  // in a ref (not state) since it's set/cleared from the transcript
+  // listener, which must not re-subscribe on every keystroke-equivalent
+  // state change.
   const autoAiTimerRef = useRef<number | null>(null);
   // askAI changes identity on every render; mirrored into a ref so the
   // transcript listener (subscribed once, on mount) always calls the latest
@@ -150,16 +146,17 @@ export function VeronicaOverlay() {
   // main window listens to (see App.tsx) — both windows share the same Rust
   // backend process/state, so no separate capture pipeline is needed here.
   //
-  // This behaves like continuous dictation. There is deliberately no question
-  // detection, no sentence-end detection, and nothing that clears the field on
-  // silence: finalized utterances are appended to a running buffer, and a
-  // silence-based auto-send (below) fires once the user stops talking — the
-  // whole point of talking to Veronica. How long that pause needs to be is
-  // adaptive: classifyQuestionCompleteness() judges from the buffered text's
-  // own wording whether it reads as a finished question or a trailing
-  // clause, so a genuine pause mid-question ("I used this because...") gets
-  // more room to continue before it's sent, while a question that already
-  // reads as complete fires quickly.
+  // This behaves like continuous dictation. There is deliberately no
+  // sentence-end detection beyond `classifyQuestionCompleteness`, and
+  // nothing that clears the field on silence: a `Final` transcript segment
+  // is the real turn-completion signal (the local VAD already decided the
+  // utterance ended — see stt/sidecar.rs), so a complete-looking Final is
+  // sent the instant it arrives, with no added wait. Only a Final that
+  // still looks incomplete (trails off on "and", a dangling comma) arms a
+  // short bounded safety-net timer instead of sending immediately — sending
+  // a bare fragment straight to the fast router risks it matching a real,
+  // possibly irreversible, command out of context; the safety net only
+  // fires if the speaker trails off and nothing more arrives to merge with.
   useEffect(() => {
     const clearAutoAiTimer = () => {
       if (autoAiTimerRef.current) {
@@ -171,13 +168,14 @@ export function VeronicaOverlay() {
     const armAutoAiTimer = () => {
       clearAutoAiTimer();
       if (busyRef.current) return;
-      const completeness = classifyQuestionCompleteness(committedRef.current);
-      const delay =
-        completeness === "complete" ? AUTO_AI_SILENCE_MS_COMPLETE : AUTO_AI_SILENCE_MS_INCOMPLETE;
+      if (classifyQuestionCompleteness(committedRef.current) === "complete") {
+        askAIRef.current();
+        return;
+      }
       autoAiTimerRef.current = window.setTimeout(() => {
         autoAiTimerRef.current = null;
         askAIRef.current();
-      }, delay);
+      }, SAFETY_NET_MS);
     };
 
     const unlistenTranscript = listen<TranscriptSegment>("transcript:update", (event) => {
