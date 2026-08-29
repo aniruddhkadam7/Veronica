@@ -695,10 +695,10 @@ async fn run_turn(
 /// feel scripted on repeat use.
 const GREETINGS: [&str; 5] = [
     "Yes, Sir?",
-    "I'm listening.",
-    "Go ahead.",
-    "Right here. What's up?",
-    "Online, and no, nothing's on fire.",
+    "I'm listening, Sir.",
+    "Go ahead, Sir.",
+    "Right here, Sir. What's up?",
+    "Online, Sir, and no, nothing's on fire.",
 ];
 
 fn pick_greeting() -> &'static str {
