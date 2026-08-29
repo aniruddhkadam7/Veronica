@@ -47,6 +47,9 @@ enum PlayerCommand {
     /// One PCM chunk, already in playback order (see this module's doc).
     Chunk(Vec<u8>),
     Stop,
+    /// Closes the current `OutputStream`/`Sink` and opens a fresh one on the
+    /// same device — see `PlaybackHandle::reopen`'s doc for why this exists.
+    Reopen,
 }
 
 /// A `Send`-safe handle to a playback thread that owns the actual
@@ -100,10 +103,33 @@ impl PlaybackHandle {
                 };
 
                 let mut player = Player::new(sink);
+                // Owns the current stream so `Reopen` can drop and replace it
+                // in place — `Player`/`Sink` don't need to know a swap ever
+                // happened, since a fresh `Sink` is handed to them each time.
+                let mut current_stream = stream;
                 loop {
                     match rx.recv_timeout(IDLE_POLL_INTERVAL) {
                         Ok(PlayerCommand::Chunk(bytes)) => player.append(&bytes),
                         Ok(PlayerCommand::Stop) => player.handle_stop(),
+                        Ok(PlayerCommand::Reopen) => {
+                            match open_output_stream(device_name.as_deref()) {
+                                Ok((new_stream, new_sink)) => {
+                                    player = Player::new(new_sink);
+                                    current_stream = new_stream;
+                                }
+                                Err(err) => {
+                                    // Keep the old (possibly dead) stream
+                                    // rather than tearing it down with
+                                    // nothing to replace it — a turn that
+                                    // fails to reopen still gets a best-effort
+                                    // attempt through whatever was already
+                                    // open, matching this module's existing
+                                    // "never hard-fail a turn over audio
+                                    // output" stance (see this fn's doc).
+                                    log::warn!("tts::player: failed to reopen output stream, reusing previous one: {err}");
+                                }
+                            }
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -122,7 +148,7 @@ impl PlaybackHandle {
                 // ever be dropped without an explicit stop — see
                 // veronica::ask_veronica) already clears it when a session
                 // ends normally.
-                drop(stream);
+                drop(current_stream);
             })
             .map_err(|e| e.to_string())?;
 
@@ -144,6 +170,35 @@ impl PlaybackHandle {
     /// disables voice output mid-answer.
     pub fn stop(&self) {
         let _ = self.tx.send(PlayerCommand::Stop);
+    }
+
+    /// Closes and reopens the output stream/sink on the same configured
+    /// device — call once at the start of every turn (see
+    /// `TtsSession::begin_turn`).
+    ///
+    /// `TtsSession`/`PlaybackHandle` are now persistent, cross-turn objects
+    /// (opened once when the mic-assistant session activates, not per
+    /// answer — see `tts::mod`'s doc), which means the underlying WASAPI
+    /// stream can sit open with no audio flowing through it for the entire
+    /// silent gap between turns. A Bluetooth output device (verified
+    /// live-observed on a MITASHI 106 headset) drops an idle audio session
+    /// under exactly that condition, and `cpal`/`rodio` 0.20 give the
+    /// application no callback or health check for that — `rodio::Sink`'s
+    /// `error_callback` is internal and unconditionally just logs via
+    /// `eprintln!`/`tracing::error!` (see `rodio::stream`'s
+    /// `new_output_stream_with_format`), so a dead stream otherwise stays
+    /// silently dead for the rest of the app session with no way to detect
+    /// it from here. The old, working pre-redesign code never held a stream
+    /// open long enough between turns to hit this.
+    ///
+    /// Reopening is a local device operation (typically tens of
+    /// milliseconds), not a network round trip, so doing it every turn does
+    /// not reintroduce the per-turn latency the persistent-session redesign
+    /// was meant to remove — only the Deepgram Flux *network* connection
+    /// needs to stay persistent for that latency win, and it still does
+    /// (this only touches the local playback stream).
+    pub fn reopen(&self) {
+        let _ = self.tx.send(PlayerCommand::Reopen);
     }
 }
 

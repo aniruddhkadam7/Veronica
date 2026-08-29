@@ -18,6 +18,16 @@
 //! TCP+TLS+WebSocket handshake on every single turn — only a hard `stop()`
 //! (barge-in) or a genuine connection failure opens a new one.
 //!
+//! The *local* playback device is the one part of this NOT kept open across
+//! turns: `begin_turn()` also reopens the output stream/sink every turn (see
+//! `player::PlaybackHandle::reopen`'s doc) — a persistent WASAPI stream with
+//! no audio flowing through it during the silent gap between turns is
+//! exactly the condition that drops a Bluetooth output device's audio
+//! session, and `rodio` 0.20 gives no way to detect that from here. This is
+//! a cheap local device reopen, not a network round trip, so it doesn't
+//! reintroduce the per-turn latency the persistent Flux *connection* above
+//! was specifically introduced to remove.
+//!
 //! `TtsSession` is `Send`/`Sync` (safe to store in `AppState`, a Tauri
 //! `State`) — see `player`'s module doc for why that required keeping
 //! `rodio`'s actual output stream confined to its own dedicated thread
@@ -307,6 +317,13 @@ impl TtsSession {
         // incorrectly fire on some LATER turn's first chunk instead of
         // never firing at all.
         self.on_first_audio_this_turn.lock().unwrap().take();
+        // Reopens the local playback device every turn — see
+        // `PlaybackHandle::reopen`'s doc for why a persistent cross-turn
+        // session otherwise silently loses audio on a Bluetooth output
+        // device after an idle gap. Cheap (a local device open, not a
+        // network call), so this doesn't reintroduce the latency the
+        // persistent-session redesign removed.
+        self.player.reopen();
     }
 
     /// Speaks `text` immediately and finalizes the turn in one call — for
