@@ -36,6 +36,45 @@ pub fn list_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     AudioDeviceManager::list_input_devices()
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectedDevicesInfo {
+    /// `None` means "use the system default" — see `state::SelectedDevices`'s doc.
+    input_id: Option<String>,
+    output_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_selected_devices(state: State<'_, AppState>) -> Result<SelectedDevicesInfo, String> {
+    Ok(SelectedDevicesInfo {
+        input_id: state.selected_devices.input(),
+        output_id: state.selected_devices.output(),
+    })
+}
+
+/// Sets the microphone Veronica listens through. `device_id` is a WASAPI
+/// endpoint ID from `list_input_devices` (or `None`/omitted for "system
+/// default"). Takes effect the next time the mic assistant/dictation session
+/// starts — see `state::SelectedDevices`'s doc; it does not restart an
+/// already-running session.
+#[tauri::command]
+pub fn set_input_device(state: State<'_, AppState>, device_id: Option<String>) -> Result<(), String> {
+    state.selected_devices.set_input(device_id);
+    Ok(())
+}
+
+/// Sets the speaker Veronica's voice plays through. `device_id` is the
+/// output device's friendly name from `list_output_devices` (matched by name
+/// against `cpal::Device::name()` — see `tts::player::open_output_stream`
+/// for why output uses a name match while input uses a WASAPI endpoint ID),
+/// or `None`/omitted for "system default". Takes effect the next time a TTS
+/// session opens (session start, or the next answer if none is open yet).
+#[tauri::command]
+pub fn set_output_device(state: State<'_, AppState>, device_id: Option<String>) -> Result<(), String> {
+    state.selected_devices.set_output(device_id);
+    Ok(())
+}
+
 /// How long a Start request will wait for a previous session's teardown
 /// (`RecordingState::Stopping`) to finish before giving up, when it lands in
 /// that narrow window rather than seeing a clean `Idle`/`Stopped`. Bounded

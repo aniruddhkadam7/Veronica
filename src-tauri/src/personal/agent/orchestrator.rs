@@ -28,6 +28,7 @@ use super::types::{AgentContent, AgentEvent, AgentMessage, StopReason};
 /// PREVIOUS one asked for it.
 const MAX_ITERATIONS: usize = 6;
 
+#[derive(Debug)]
 pub struct AgentOutcome {
     pub final_text: String,
     /// One short summary per tool call made this turn, in order — folded
@@ -51,8 +52,11 @@ pub trait AgenticProvider: Send + Sync {
     /// new utterance (barge-in) or a fast follow-up would keep emitting
     /// text/tool-call deltas into a TTS session and event stream that a
     /// NEWER turn has already reset (`TtsSession::begin_turn`), audibly
-    /// mixing the two. Implementations should stop reading/return `Ok(())`
-    /// as soon as `cancel.is_cancelled()` is observed.
+    /// mixing the two. Implementations must return `Err("cancelled".into())`
+    /// (never `Ok(())`) as soon as `cancel.is_cancelled()` is observed — an
+    /// `Ok` here previously let a mid-stream-cancelled turn's partial text
+    /// be treated as a normal completed answer instead of being cleanly
+    /// discarded.
     fn stream_agentic<'a>(
         &'a self,
         messages: &'a [AgentMessage],
@@ -72,34 +76,61 @@ pub async fn run_agent_loop(
     provider: &dyn AgenticProvider,
     mut messages: Vec<AgentMessage>,
     cancel: &CancelToken,
+    turn_id: &str,
     mut on_text_delta: impl FnMut(&str) + Send,
+    mut on_progress: impl FnMut(&str) + Send,
 ) -> Result<AgentOutcome, String> {
     let tools = tool_schema::all_tools();
     let mut actions_taken = Vec::new();
     let mut final_text = String::new();
     let mut iterations_used = 0;
 
-    for _ in 0..MAX_ITERATIONS {
+    log::info!("[LLM_START] turn_id={turn_id}");
+
+    for iteration in 0..MAX_ITERATIONS {
         if cancel.is_cancelled() {
+            log::info!("[INTERRUPT] turn_id={turn_id} agent loop cancelled before iteration {iteration}");
             return Err("cancelled".to_string());
         }
         iterations_used += 1;
 
         let mut turn_text = String::new();
+        let mut token_count = 0u32;
         let mut pending_tool_calls: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
 
         {
             let mut on_event = |event: AgentEvent| match event {
                 AgentEvent::TextDelta(delta) => {
+                    token_count += 1;
+                    // debug, not info: a single answer can stream dozens to
+                    // hundreds of these — [LLM_COMPLETE] below logs the
+                    // aggregate (token/char count) at info level instead.
+                    log::debug!("[LLM_TOKEN] turn_id={turn_id} iteration={iteration} n={token_count} text={delta:?}");
                     turn_text.push_str(&delta);
                     on_text_delta(&delta);
                 }
-                AgentEvent::ToolCallReady { id, name, input } => pending_tool_calls.push((id, name, input)),
+                AgentEvent::ToolCallReady { id, name, input } => {
+                    log::info!("[LLM_COMPLETE] turn_id={turn_id} iteration={iteration} tool_call name={name} id={id}");
+                    pending_tool_calls.push((id, name, input));
+                }
                 AgentEvent::Done { stop_reason: sr } => stop_reason = sr,
             };
-            provider.stream_agentic(&messages, &tools, cancel, &mut on_event).await?;
+            if let Err(err) = provider.stream_agentic(&messages, &tools, cancel, &mut on_event).await {
+                if err == "cancelled" {
+                    log::info!("[INTERRUPT] turn_id={turn_id} agent loop cancelled mid-stream at iteration {iteration}");
+                } else {
+                    log::error!("[TURN_ERROR] turn_id={turn_id} iteration={iteration} provider stream failed: {err}");
+                }
+                return Err(err);
+            }
         }
+
+        log::info!(
+            "[LLM_COMPLETE] turn_id={turn_id} iteration={iteration} tokens={token_count} chars={} stop_reason={stop_reason:?} tool_calls={}",
+            turn_text.len(),
+            pending_tool_calls.len()
+        );
 
         final_text = turn_text.clone();
 
@@ -124,11 +155,19 @@ pub async fn run_agent_loop(
 
         // EXECUTE TOOL -> OBSERVE RESULT, for every tool call this
         // iteration asked for (a model can ask for more than one at once).
+        // `on_progress` fires right before each one runs — a short,
+        // human-readable line ("Checking your documents...") the caller
+        // streams into the conversation exactly like a text delta, so a
+        // multi-step task reads as natural progress rather than going
+        // silent while tools execute (requirement 11). Never the raw tool
+        // name or JSON arguments — see `tool_schema::progress_message`.
         let mut results = Vec::new();
         for (id, name, input) in pending_tool_calls {
             if cancel.is_cancelled() {
+                log::info!("[INTERRUPT] turn_id={turn_id} agent loop cancelled before executing tool call {name}");
                 return Err("cancelled".to_string());
             }
+            on_progress(&tool_schema::progress_message(&name, &input));
             let (text, image, is_error) = execute_one_tool_call(&name, &input).await;
             actions_taken.push(format!("{name}({input}) -> {text}"));
             results.push(AgentContent::ToolResult { tool_use_id: id, text, image, is_error });
@@ -139,6 +178,7 @@ pub async fn run_agent_loop(
         messages.push(AgentMessage::tool_results(results));
     }
 
+    log::info!("[LLM_COMPLETE] turn_id={turn_id} agent loop done — iterations_used={iterations_used} actions_taken={}", actions_taken.len());
     Ok(AgentOutcome { final_text, actions_taken, iterations_used })
 }
 
@@ -219,7 +259,7 @@ mod tests {
             let provider = text_only_provider("Hello there.");
             let cancel = CancelToken::new();
             let mut collected = String::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, |d| collected.push_str(d))
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", |d| collected.push_str(d), |_| {})
                 .await
                 .unwrap();
             assert_eq!(outcome.final_text, "Hello there.");
@@ -243,7 +283,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let cancel = CancelToken::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, |_| {}).await.unwrap();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", |_| {}, |_| {}).await.unwrap();
             assert_eq!(outcome.iterations_used, 2);
             assert_eq!(outcome.final_text, "It's now.");
             assert_eq!(outcome.actions_taken.len(), 1);
@@ -263,8 +303,52 @@ mod tests {
             };
             let cancel = CancelToken::new();
             cancel.cancel();
-            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, |_| {}).await;
+            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", |_| {}, |_| {}).await;
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn a_provider_cancelled_mid_stream_never_returns_its_partial_text_as_a_real_answer() {
+        // Regression test for the exact live-observed bug: a provider that
+        // returns `Ok(())` (instead of `Err("cancelled")`) after observing
+        // cancellation mid-stream used to make `run_agent_loop` treat
+        // whatever partial text had streamed so far as a normal, complete
+        // answer — a stale/interrupted turn's fragment getting spoken and
+        // returned as if it were real, racing whatever the newer turn that
+        // superseded it was doing.
+        struct CancelsMidStreamProvider;
+        impl AgenticProvider for CancelsMidStreamProvider {
+            fn stream_agentic<'a>(
+                &'a self,
+                _messages: &'a [AgentMessage],
+                _tools: &'a [ToolSpec],
+                _cancel: &'a CancelToken,
+                on_event: &'a mut (dyn FnMut(AgentEvent) + Send),
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+                Box::pin(async move {
+                    // Streams a plausible-looking partial answer, THEN
+                    // discovers cancellation and correctly reports it as an
+                    // error instead of quietly returning Ok — this is the
+                    // fixed behavior every real provider's per-chunk check
+                    // must match.
+                    on_event(AgentEvent::TextDelta("This looks like a real an".to_string()));
+                    Err("cancelled".to_string())
+                })
+            }
+        }
+        tauri::async_runtime::block_on(async {
+            let provider = CancelsMidStreamProvider;
+            let cancel = CancelToken::new();
+            let mut collected = String::new();
+            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", |d| collected.push_str(d), |_| {}).await;
+            assert!(result.is_err(), "a mid-stream cancellation must surface as an Err, never Ok(partial_text)");
+            assert_eq!(result.unwrap_err(), "cancelled");
+            // The delta DID reach the caller as it streamed (that's correct
+            // — text already spoken/shown can't be un-sent), but the loop's
+            // own return value must never claim this partial fragment was
+            // the real, final answer.
+            assert_eq!(collected, "This looks like a real an");
         });
     }
 
@@ -284,7 +368,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let cancel = CancelToken::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("loop forever")], &cancel, |_| {}).await.unwrap();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("loop forever")], &cancel, "test-turn", |_| {}, |_| {}).await.unwrap();
             assert_eq!(outcome.iterations_used, MAX_ITERATIONS);
             assert_eq!(provider.calls.load(Ordering::SeqCst), MAX_ITERATIONS);
         });

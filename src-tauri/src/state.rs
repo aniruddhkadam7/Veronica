@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::audio::{PauseSignal, StopSignal};
+use crate::conversation::ConversationStore;
 use crate::rag::RagServiceHandle;
 use crate::transcript::{RecordingState, TranscriptManager};
 use crate::tts::{TtsSession, TtsSpeakingSignal};
@@ -31,6 +32,56 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Explicit user mute flag for the mic-assistant session. Mirrors
+/// `CancelToken`'s `Arc<AtomicBool>` handle pattern: cheap to `Clone`, shared
+/// between the Tauri commands that toggle it and the pump loop that reads it.
+#[derive(Clone, Default)]
+pub struct MicMuteSignal(Arc<AtomicBool>);
+
+impl MicMuteSignal {
+    pub fn set_muted(&self, muted: bool) {
+        self.0.store(muted, Ordering::SeqCst);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// User-selected input (microphone) and output (speaker) device, by WASAPI
+/// endpoint ID (see `audio::AudioDeviceInfo::id`) — `None` means "use the
+/// system default", which is also the behavior before any selection is ever
+/// made. Read by `MicrophoneCapture::start` (input) and `TtsSession::start`/
+/// `tts::player::PlaybackHandle::start` (output) each time a new
+/// capture/playback session begins; changing the selection while a session
+/// is already running only takes effect on its next start (mirrors how a
+/// Windows default-device change is already handled — see those modules'
+/// "self-heals onto whatever is now the default" retry loops), not a live
+/// device swap mid-stream.
+#[derive(Default)]
+pub struct SelectedDevices {
+    pub input_id: Mutex<Option<String>>,
+    pub output_id: Mutex<Option<String>>,
+}
+
+impl SelectedDevices {
+    pub fn input(&self) -> Option<String> {
+        self.input_id.lock().unwrap().clone()
+    }
+
+    pub fn output(&self) -> Option<String> {
+        self.output_id.lock().unwrap().clone()
+    }
+
+    pub fn set_input(&self, id: Option<String>) {
+        *self.input_id.lock().unwrap() = id;
+    }
+
+    pub fn set_output(&self, id: Option<String>) {
+        *self.output_id.lock().unwrap() = id;
     }
 }
 
@@ -87,6 +138,14 @@ pub struct AppState {
     /// picked up acoustically by the mic, gets transcribed and answered as
     /// if the user said it.
     pub tts_speaking: TtsSpeakingSignal,
+    /// Explicit user mute for the mic-assistant session (the header's mute
+    /// toggle next to Stop) — independent of `tts_speaking`, which mutes for
+    /// the different reason of not hearing Veronica's own voice. Checked
+    /// alongside `tts_speaking` in `voice_command::mod`'s pump loop so either
+    /// condition withholds audio from STT. One instance for the whole app
+    /// (like `tts_speaking`), since there is only ever one mic-assistant
+    /// session at a time.
+    pub mic_muted: MicMuteSignal,
     /// The currently in-flight voice turn's cancellation token, if any. See
     /// `CancelToken`'s doc. `None` between turns.
     pub current_turn: Mutex<Option<CancelToken>>,
@@ -103,6 +162,15 @@ pub struct AppState {
     /// through the voice pipeline — `ask_veronica` starts a fresh one in
     /// that case instead of waiting for a slot that will never be filled.
     pub turn_telemetry: Mutex<Option<std::sync::Arc<crate::hardware::telemetry::TurnTelemetry>>>,
+    /// The one shared conversation history — see `conversation`'s doc. Both
+    /// the floating widget and the full overlay read/write this same store
+    /// (via `ask_veronica` and the `get_conversation_history` command),
+    /// which is what makes "the widget and overlay show the same live
+    /// conversation" true across their separate webviews.
+    pub conversation: Mutex<ConversationStore>,
+    /// User-selected mic/speaker device, if any — see `SelectedDevices`'s
+    /// doc. One instance for the whole app, like `mic_muted`/`tts_speaking`.
+    pub selected_devices: SelectedDevices,
 }
 
 impl AppState {

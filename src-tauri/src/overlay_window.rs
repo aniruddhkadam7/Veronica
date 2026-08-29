@@ -32,16 +32,22 @@ pub struct OverlayCaptureStatus {
 /// open at the same time, but each needs its own window identity).
 pub fn show_overlay_window(app: &AppHandle, label: &str, title: &str) -> Result<OverlayCaptureStatus, String> {
     let excluded = if let Some(existing) = app.get_webview_window(label) {
-        // Reset the frontend's session-scoped React state before showing a
-        // *reused* overlay window (the WebView2 process/DOM is never torn
-        // down between close and reopen — only hidden) — otherwise a
-        // meeting ended (or mid-ending) on the previous close would still
-        // be showing its Summary screen (or stuck "Ending…") the instant
-        // this window reappears for a brand-new meeting, before any of
-        // this new session's events have even arrived. Best-effort: the
-        // webview may not have a listener registered yet on the very first
-        // reuse, which is fine — there's nothing stale to clear at that
-        // point anyway.
+        // Resets the frontend's transient UI-only state (an open Settings
+        // panel, a pending "close this conversation?" confirmation, a stale
+        // opacity-hint readout) before showing a *reused* overlay window
+        // (the WebView2 process/DOM is never torn down between close and
+        // reopen — only hidden) — otherwise those would still be showing
+        // from whatever state they were left in on the previous close.
+        // Deliberately does NOT clear the conversation itself: the shared
+        // conversation (`AppState.conversation`, see conversation.rs) is
+        // backend-owned and lives independently of this window being open,
+        // closed, or reused — VeronicaOverlay.tsx's handler for this event
+        // re-hydrates from `get_conversation_history` instead of resetting
+        // to empty, so the same live conversation continues across
+        // close/reopen exactly as it does across widget/overlay switches.
+        // Best-effort: the webview may not have a listener registered yet
+        // on the very first reuse, which is fine — there's nothing stale to
+        // clear at that point anyway.
         let _ = existing.emit("overlay:reset-session", ());
         center_overlay_on_screen(&existing, false);
         existing.show().map_err(|e| e.to_string())?;

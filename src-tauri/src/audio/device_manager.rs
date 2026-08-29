@@ -1,6 +1,7 @@
 use wasapi::{DeviceCollection, Direction};
 
 #[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AudioDeviceInfo {
     pub id: String,
     pub name: String,
@@ -21,7 +22,26 @@ impl AudioDeviceManager {
         Self::list_devices(Direction::Capture)
     }
 
+    /// Runs on a dedicated, throwaway OS thread — unlike `mic_capture`/
+    /// `system_capture`'s dedicated capture threads (which always start
+    /// fresh and never touched COM before), this is called from a Tauri
+    /// command handler, and the WebView2 host thread that runs on already
+    /// has COM initialized apartment-threaded (STA) by the WebView2 runtime
+    /// itself. `wasapi::initialize_mta()` can't change an already-set COM
+    /// mode on a thread (`RPC_E_CHANGED_MODE`, 0x80010106) — it can only
+    /// initialize a thread that has no COM mode yet — so this must run on a
+    /// fresh thread that has never called `CoInitializeEx`, exactly like the
+    /// capture threads already do.
     fn list_devices(direction: Direction) -> Result<Vec<AudioDeviceInfo>, String> {
+        std::thread::Builder::new()
+            .name("audio-device-enum".into())
+            .spawn(move || Self::list_devices_on_this_thread(direction))
+            .map_err(|e| e.to_string())?
+            .join()
+            .map_err(|_| "audio device enumeration thread panicked".to_string())?
+    }
+
+    fn list_devices_on_this_thread(direction: Direction) -> Result<Vec<AudioDeviceInfo>, String> {
         wasapi::initialize_mta().ok().map_err(|e| e.to_string())?;
 
         let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| e.to_string())?;

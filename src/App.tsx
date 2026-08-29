@@ -22,6 +22,8 @@ import {
   IconChevronDown,
   IconClose,
   IconMaximize,
+  IconMic,
+  IconMicOff,
   IconMinimize,
   IconRestore,
   IconSettings,
@@ -75,6 +77,7 @@ function App() {
     };
   }, []);
   const [sessionState, setSessionState] = useState<SessionState>("IDLE");
+  const [micMuted, setMicMuted] = useState(false);
   const [openPopover, setOpenPopover] = useState<Popover>(null);
   const [error, setError] = useState<string | null>(null);
   const [isMaximized, setIsMaximized] = useState(false);
@@ -163,6 +166,7 @@ function App() {
   const handleActivate = useCallback(async () => {
     setError(null);
     setSessionState("STARTING");
+    setMicMuted(false);
     closePopover();
     try {
       uploadDocumentContext(VERONICA_CONTEXT_SECTIONS, documentContext);
@@ -200,10 +204,11 @@ function App() {
     }
   }, [documentContext, closePopover]);
 
-  // Fully deactivates: stops the mic, hides both the widget and the overlay
-  // (if it happened to be open), and ends the backend session. This is the
-  // ONLY thing that ends the session — closing the overlay (see
-  // `interview-mode:overlay-closed` above) no longer does.
+  // Fully deactivates: stops the mic, stops Veronica mid-answer if she's
+  // still speaking, hides both the widget and the overlay (if it happened to
+  // be open), and ends the backend session. This is the ONLY thing that ends
+  // the session — closing the overlay (see `interview-mode:overlay-closed`
+  // above) no longer does.
   const handleStop = useCallback(async () => {
     invoke("hide_veronica_widget").catch(() => {});
     if (overlayVisible) {
@@ -211,7 +216,18 @@ function App() {
     }
     setOverlayVisible(false);
     setSessionState("IDLE");
+    setMicMuted(false);
     invoke("stop_mic_assistant").catch(() => {});
+    // Cancels any in-flight turn and stops TTS playback immediately — see
+    // veronica::stop_speaking — so Stop actually silences Veronica instead
+    // of only ending the mic while a reply keeps playing out.
+    invoke("stop_speaking").catch(() => {});
+    // Ends the conversation itself — the ONE shared history both the
+    // widget and overlay read/write (see conversation.rs's doc). This is
+    // the only place the conversation is ever cleared: opening/closing
+    // either window must never reset it, only explicitly ending the
+    // session via Stop.
+    invoke("reset_conversation").catch(() => {});
     // Fire-and-forget: finalizes the backend session (if one was started)
     // so its minutes get decremented. Never blocks Stop and never surfaces
     // an error to the user — a network blip here must not cost the user
@@ -219,6 +235,19 @@ function App() {
     // isn't signed in (see start_backend_session).
     invoke("end_backend_session").catch(() => {});
   }, [overlayVisible]);
+
+  // Mutes/unmutes the mic without ending the session — unlike Stop, this
+  // leaves the backend session, widget, and overlay (if open) untouched;
+  // it only tells the mic-assistant pump loop to withhold audio from STT
+  // (see voice_command::mod's set_mic_muted). Optimistic local toggle since
+  // the backend call can't meaningfully fail once a session is active.
+  const handleToggleMute = useCallback(() => {
+    setMicMuted((cur) => {
+      const next = !cur;
+      invoke("set_mic_muted", { muted: next }).catch((e) => setError(String(e)));
+      return next;
+    });
+  }, []);
 
   // "Open": reveals the full conversation overlay on top of the already-
   // running widget session — never starts/restarts anything, since
@@ -386,6 +415,19 @@ function App() {
           >
             <ParticlesOrb state={sessionState === "ACTIVE" ? "listening" : "idle"} size={20} speed={1} colorFrom="#f0abfc" colorTo="#818cf8" />
           </button>
+
+          {sessionState === "ACTIVE" && (
+            <button
+              type="button"
+              className={`compact-header-btn icon${micMuted ? " active" : ""}`}
+              onClick={handleToggleMute}
+              title={micMuted ? "Unmute Veronica's mic" : "Mute Veronica's mic"}
+              aria-label={micMuted ? "Unmute microphone" : "Mute microphone"}
+              aria-pressed={micMuted}
+            >
+              {micMuted ? <IconMicOff /> : <IconMic />}
+            </button>
+          )}
 
           {sessionState === "ACTIVE" && (
             <Button variant="danger" onClick={handleStop}>

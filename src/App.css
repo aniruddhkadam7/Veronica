@@ -432,6 +432,14 @@ body.compact-transparent {
   color: var(--text);
 }
 
+/* Muted-mic indicator (the mute toggle next to Stop) — reuses the same
+   danger tone as the Stop button so "not listening" reads unambiguously. */
+.compact-header-btn.icon.active {
+  color: var(--danger);
+  border-color: var(--danger-hover);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
 .compact-header-btn svg {
   flex-shrink: 0;
 }

@@ -28,7 +28,7 @@ import { loadWidgetSettings, type WidgetSettings } from "./widgetSettings";
 /// is the only way to reveal the full conversation view, and it does so
 /// without touching this session at all (see App.tsx's handleOpenOverlay).
 export function VeronicaWidget() {
-  const { orbState, lastError } = useVeronicaOrbState();
+  const { orbState, levelRef, lastError } = useVeronicaOrbState();
   const [widgetSettings, setWidgetSettings] = useState<WidgetSettings>(() => loadWidgetSettings());
 
   // show_widget (veronica_widget.rs) always docks the OS window at its own
@@ -89,6 +89,14 @@ export function VeronicaWidget() {
   // Real failures already surface via useVeronicaOrbState's "veronica:error"
   // listener (Groq/Deepgram/sidecar/ask_veronica failures); the orb simply
   // returns to idle/listening on error, same as before this hook existed.
+  //
+  // No local history bookkeeping needed here anymore: ask_veronica derives
+  // conversational context from the ONE shared backend conversation store
+  // (see conversation.rs's `completed_history`) rather than a caller-
+  // supplied list, so a follow-up spoken here correctly resolves against
+  // whatever was said through the overlay too — this widget used to keep
+  // its own private, invisible history just for itself, which meant it had
+  // no idea what was said through the OTHER window.
   useAutoAsk({ acceptSource, answerOptions });
 
   return (
@@ -105,6 +113,7 @@ export function VeronicaWidget() {
         intensity={widgetSettings.intensity}
         colorFrom={widgetSettings.colorFrom}
         colorTo={widgetSettings.colorTo}
+        levelRef={levelRef}
       />
     </div>
   );

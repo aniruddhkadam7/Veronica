@@ -245,14 +245,41 @@ impl Default for FirstTokenTracker {
 /// both of its endpoints marked — a turn that took the fast-router path
 /// (no LLM/TTS stages) still gets a useful summary with just its stages,
 /// rather than a line full of "n/a".
-#[derive(Default)]
 pub struct TurnTelemetry {
+    /// Correlates every `[TAG] turn_id=... ` log line this turn produces
+    /// (see `veronica::ask_veronica`, `personal::agent::orchestrator`) back
+    /// to one real conversational turn — required for requirement 13's
+    /// logging (and for making sense of overlapping turns: a barge-in means
+    /// two `TurnTelemetry`s can legitimately be alive at once, briefly).
+    id: String,
     stages: std::sync::Mutex<std::collections::HashMap<&'static str, Instant>>,
+}
+
+/// Generates a turn id unique within this process run — a monotonic counter
+/// suffixed onto the current time, not a full UUID dependency, matching this
+/// crate's existing `transcript::mod`'s `uuid_like_id` convention for the
+/// same "good enough to grep for, not globally unique across machines"
+/// need.
+fn new_turn_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    format!("t-{now_ms:x}-{n:x}")
 }
 
 impl TurnTelemetry {
     pub fn new() -> Self {
-        Self::default()
+        Self { id: new_turn_id(), stages: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// This turn's id — include it in every log line for this turn (see
+    /// `veronica::ask_veronica`'s `[TURN]`/`[STATE]`/`[ERROR]` logging and
+    /// `personal::agent::orchestrator`'s `[LLM_*]` logging) so the whole
+    /// lifecycle of one turn can be grepped out of interleaved logs from
+    /// concurrent/overlapping turns (a barge-in briefly has two).
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     /// Records `stage` as having happened right now, unless it was already
@@ -284,7 +311,7 @@ impl TurnTelemetry {
         ordered.sort_by_key(|(_, at)| *at);
         for (label, at) in &ordered {
             if let Some(start) = start {
-                log::info!("perf: turn_stage={label} ms_since_turn_start={}", at.saturating_duration_since(start).as_millis());
+                log::info!("perf: turn_id={} turn_stage={label} ms_since_turn_start={}", self.id, at.saturating_duration_since(start).as_millis());
             }
         }
 
@@ -296,7 +323,8 @@ impl TurnTelemetry {
         let total_turn_latency = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete);
 
         log::info!(
-            "perf: turn_summary speech_to_stt_final_ms={} stt_final_to_router_decision_ms={} stt_final_to_llm_first_token_ms={} llm_first_token_to_tts_first_audio_ms={} speech_end_to_first_audio_ms={} total_turn_latency_ms={} tier={:?} mode={:?} pressure={:?}",
+            "perf: turn_id={} turn_summary speech_to_stt_final_ms={} stt_final_to_router_decision_ms={} stt_final_to_llm_first_token_ms={} llm_first_token_to_tts_first_audio_ms={} speech_end_to_first_audio_ms={} total_turn_latency_ms={} tier={:?} mode={:?} pressure={:?}",
+            self.id,
             fmt_opt(speech_to_stt_final),
             fmt_opt(stt_final_to_router_decision),
             fmt_opt(stt_final_to_llm_first_token),
@@ -639,6 +667,14 @@ mod tests {
         turn.mark(PipelineStage::SpeechEnded);
         let second = turn.get(PipelineStage::SpeechEnded).unwrap();
         assert_eq!(first, second, "a later mark() for the same stage must not overwrite the first");
+    }
+
+    #[test]
+    fn each_turn_telemetry_gets_a_distinct_non_empty_id() {
+        let a = TurnTelemetry::new();
+        let b = TurnTelemetry::new();
+        assert!(!a.id().is_empty());
+        assert_ne!(a.id(), b.id(), "concurrent/overlapping turns (e.g. a barge-in) must be distinguishable in logs");
     }
 
     #[test]

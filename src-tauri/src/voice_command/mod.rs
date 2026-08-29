@@ -80,7 +80,8 @@ pub fn start_mic_assistant(
     // time until the STT sidecar (which DOES block until it signals ready)
     // is usable.
     let session_start = Instant::now();
-    let mic_thread: JoinHandle<()> = MicrophoneCapture::start(audio_tx, stop.clone())?;
+    let selected_input = app.state::<AppState>().selected_devices.input();
+    let mic_thread: JoinHandle<()> = MicrophoneCapture::start(audio_tx, stop.clone(), selected_input)?;
     let stt_num_threads = crate::hardware::effective_config_checked(&app).stt_num_threads;
     let mut sidecar = crate::stt::SttSidecar::spawn(
         AudioSource::Microphone,
@@ -189,6 +190,7 @@ pub fn start_mic_assistant(
         .map_err(|e| e.to_string())?;
 
     let tts_speaking = app.state::<AppState>().tts_speaking.clone();
+    let mic_muted = app.state::<AppState>().mic_muted.clone();
     let app_for_level = app.clone();
     let app_for_barge_in = app.clone();
     let barge_in_rms = barge_in_rms_threshold();
@@ -211,6 +213,11 @@ pub fn start_mic_assistant(
             // for why a single loud chunk isn't enough on its own.
             let mut was_muted = false;
             let mut loud_since: Option<Instant> = None;
+            // Whether the user's own mute toggle (the header's mute button,
+            // separate from Stop) was active on the previous chunk — tracked
+            // so re-enabling it flushes the decoder exactly once, same as
+            // `was_muted` does for the TTS-speaking case below.
+            let mut was_user_muted = false;
             for chunk in audio_rx.iter() {
                 // Emitted unconditionally (even while muted for TTS) so the
                 // orb widgets' "listening" animation reflects real mic input
@@ -223,6 +230,27 @@ pub fn start_mic_assistant(
                     "audio:level",
                     crate::commands::AudioLevelEvent { source: chunk.source, rms_level: chunk.rms_level },
                 );
+
+                // Deliberate user mute takes priority over everything else,
+                // including barge-in: unlike the TTS-speaking mute below
+                // (which exists only to stop Veronica hearing herself, so a
+                // loud enough voice should always be able to interrupt it),
+                // the user explicitly asked not to be listened to, so no
+                // amount of speech energy should override that.
+                if mic_muted.is_muted() {
+                    if !was_user_muted {
+                        if let Err(err) = sidecar.flush() {
+                            log::warn!("mic assistant: failed to flush STT sidecar before user mute: {err}");
+                        }
+                        was_user_muted = true;
+                        loud_since = None;
+                    }
+                    continue;
+                }
+                if was_user_muted {
+                    was_user_muted = false;
+                }
+
                 let is_speaking = tts_speaking.is_speaking();
                 if is_speaking {
                     if !was_muted {
@@ -302,8 +330,27 @@ pub fn start_mic_assistant(
     Ok(())
 }
 
+/// Toggles the explicit user mute (header's mute button) on or off. Safe to
+/// call whether or not the mic assistant is currently running — it just
+/// sets the shared flag the pump loop reads, so a mute set before Start
+/// takes effect the moment the session begins, and it clears itself when
+/// `stop_mic_assistant` isn't called and the same session is later resumed.
 #[tauri::command]
-pub fn stop_mic_assistant(session: State<'_, MicAssistantSession>) -> Result<(), String> {
+pub fn set_mic_muted(state: State<'_, AppState>, muted: bool) -> Result<(), String> {
+    state.mic_muted.set_muted(muted);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_mic_muted(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.mic_muted.is_muted())
+}
+
+#[tauri::command]
+pub fn stop_mic_assistant(
+    state: State<'_, AppState>,
+    session: State<'_, MicAssistantSession>,
+) -> Result<(), String> {
     let (stop_signal, mic_thread) = {
         let mut guard = session.0.lock().map_err(|e| e.to_string())?;
         (guard.stop_signal.take(), guard.mic_thread.take())
@@ -315,5 +362,8 @@ pub fn stop_mic_assistant(session: State<'_, MicAssistantSession>) -> Result<(),
     if let Some(handle) = mic_thread {
         let _ = handle.join();
     }
+    // Reset for the next session — otherwise a muted session ended via Stop
+    // would leave the next Start silently pre-muted with no visible cause.
+    state.mic_muted.set_muted(false);
     Ok(())
 }

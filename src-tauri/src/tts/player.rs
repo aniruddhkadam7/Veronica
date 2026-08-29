@@ -21,6 +21,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{OutputStream, Sink};
 
 use super::deepgram_flux::SAMPLE_RATE;
@@ -70,18 +71,23 @@ impl PlaybackHandle {
     /// forwarding audio to STT, so Veronica's own speech (picked up
     /// acoustically by the mic, with no cable involved) doesn't get
     /// transcribed and answered as if the user said it.
-    pub fn start(speaking: TtsSpeakingSignal) -> Result<Self, String> {
+    ///
+    /// `device_name`: the friendly name of a specific output device to open
+    /// instead of the system default (see `state::SelectedDevices`'s doc),
+    /// matched against `cpal::Device::name()` — cpal has no by-ID lookup the
+    /// way `wasapi::DeviceEnumerator::get_device` does for capture, so this
+    /// enumerates `cpal::default_host().output_devices()` and matches by
+    /// name, falling back to the default device if no device with that name
+    /// is currently present (e.g. it was unplugged) rather than failing the
+    /// whole session outright.
+    pub fn start(speaking: TtsSpeakingSignal, device_name: Option<String>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel::<PlayerCommand>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         std::thread::Builder::new()
             .name("tts-player".into())
             .spawn(move || {
-                let opened = OutputStream::try_default()
-                    .map_err(|e| format!("failed to open default audio output device: {e}"))
-                    .and_then(|(stream, handle)| {
-                        Sink::try_new(&handle).map_err(|e| format!("failed to create audio sink: {e}")).map(|sink| (stream, sink))
-                    });
+                let opened = open_output_stream(device_name.as_deref());
                 let (stream, sink) = match opened {
                     Ok(pair) => {
                         let _ = ready_tx.send(Ok(()));
@@ -139,6 +145,33 @@ impl PlaybackHandle {
     pub fn stop(&self) {
         let _ = self.tx.send(PlayerCommand::Stop);
     }
+}
+
+/// Opens `device_name` (matched against `cpal::Device::name()`) if given and
+/// still present, otherwise the system default output device, and creates
+/// its `Sink` — see `PlaybackHandle::start`'s doc.
+fn open_output_stream(device_name: Option<&str>) -> Result<(OutputStream, Sink), String> {
+    let (stream, handle) = match device_name {
+        Some(name) => {
+            let found = cpal::default_host()
+                .output_devices()
+                .ok()
+                .and_then(|mut devices| devices.find(|d| d.name().map(|n| n == name).unwrap_or(false)));
+            match found {
+                Some(device) => OutputStream::try_from_device(&device)
+                    .map_err(|e| format!("failed to open output device \"{name}\": {e}"))?,
+                None => {
+                    log::warn!("selected output device \"{name}\" not found, falling back to the system default");
+                    OutputStream::try_default()
+                        .map_err(|e| format!("failed to open default audio output device: {e}"))?
+                }
+            }
+        }
+        None => OutputStream::try_default()
+            .map_err(|e| format!("failed to open default audio output device: {e}"))?,
+    };
+    let sink = Sink::try_new(&handle).map_err(|e| format!("failed to create audio sink: {e}"))?;
+    Ok((stream, sink))
 }
 
 /// The operations `Player` needs from a sink: append a buffer of samples to

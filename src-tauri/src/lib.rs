@@ -10,7 +10,10 @@ mod analyzer;
 pub mod audio;
 mod backend;
 mod commands;
+mod conversation;
 mod http_client;
+mod interrupt;
+mod language;
 // Public so the RAG/STT spawn call sites and the `rag-bench`/`stt-bench`
 // verification steps (Milestone 4a) can reference `PerformanceConfig`
 // without a re-export chain.
@@ -196,6 +199,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_output_devices,
             commands::list_input_devices,
+            commands::get_selected_devices,
+            commands::set_input_device,
+            commands::set_output_device,
             commands::start_system_audio_capture,
             commands::pause_recording,
             commands::resume_recording,
@@ -226,6 +232,10 @@ pub fn run() {
             veronica_window::end_backend_session,
             veronica::ask_veronica,
             veronica::speak_greeting,
+            veronica::stop_speaking,
+            veronica::try_interrupt,
+            veronica::get_conversation_history,
+            veronica::reset_conversation,
             veronica_widget::show_veronica_widget,
             veronica_widget::hide_veronica_widget,
             veronica_widget::resize_veronica_widget,
@@ -248,6 +258,8 @@ pub fn run() {
             personal::commands::personal_clear_api_key,
             voice_command::start_mic_assistant,
             voice_command::stop_mic_assistant,
+            voice_command::set_mic_muted,
+            voice_command::get_mic_muted,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -392,19 +392,28 @@ def main() -> None:
     def finalize_current_utterance(end_time: float) -> None:
         nonlocal utterance_start, last_partial_text, has_pending_audio, stream
         # This engine's own decode is never shown to the user (see module
-        # docstring) — emitted as-is, no output correction applied.
-        text = recognizer.get_result(stream).strip()
+        # docstring) — Groq (on the Rust side) is the only real transcription
+        # source; this local `text` is purely a leftover of the decode this
+        # engine already had to run for endpoint detection. Every caller of
+        # this function already only calls it when `has_pending_audio` is
+        # true (a real, VAD-passed utterance happened) — gating again here on
+        # `text` being non-empty is redundant AND wrong: this engine's own
+        # decode can legitimately come back empty for audio a stronger model
+        # (Groq) would still transcribe fine (e.g. quieter/narrowband mic
+        # input, like Bluetooth headset audio), which silently dropped the
+        # entire utterance — no "final" line ever reached the Rust side, so
+        # Groq was never even called. Emitting unconditionally lets Groq be
+        # the one to decide whether there's real speech in the buffered audio.
         start_time = utterance_start if utterance_start is not None else end_time
-        if text:
-            emit(
-                {
-                    "type": "final",
-                    "text": text,
-                    "source": source,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                }
-            )
+        emit(
+            {
+                "type": "final",
+                "text": recognizer.get_result(stream).strip(),
+                "source": source,
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        )
         # Fresh stream for the next utterance — resetting the same stream
         # object after an endpoint is the sherpa-onnx-recommended pattern
         # for streaming transducers with endpoint detection enabled.

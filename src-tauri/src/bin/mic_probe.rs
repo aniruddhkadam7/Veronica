@@ -36,7 +36,7 @@ fn main() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let stop = StopSignal::new();
 
-    let handle = match MicrophoneCapture::start(tx, stop.clone()) {
+    let handle = match MicrophoneCapture::start(tx, stop.clone(), None) {
         Ok(h) => h,
         Err(err) => {
             eprintln!("mic capture failed: {err}");

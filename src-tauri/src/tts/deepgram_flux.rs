@@ -57,6 +57,17 @@ const MODEL: &str = "flux-sienna-en";
 /// pitch/speed.
 pub const SAMPLE_RATE: u32 = 24_000;
 
+/// Flux's delivery-register dial: an integer from `-2` (calm) to `2`
+/// (animated), fixed for the whole connection (not adjustable mid-session
+/// via `Configure` — confirmed against Deepgram's Flux TTS reference).
+/// Omitting this from the connect URL leaves it at Flux's own default of
+/// `0`, a neutral/flat register — which is what made Sienna sound flat and
+/// robotic here despite the voice itself being described by Deepgram as
+/// "warm, caring." `1` picks a natural, conversational-but-not-theatrical
+/// register rather than maxing out at `2` (animated enough to sound
+/// artificial for a general assistant voice).
+const EXPRESSIVITY: i8 = 1;
+
 /// How long to wait for the initial TCP+TLS+WebSocket handshake to complete
 /// before giving up on one connection attempt. Set on the raw socket before
 /// `tungstenite::connect` runs the handshake, so a network path that never
@@ -365,7 +376,7 @@ impl FluxSession {
 /// sample_rate) — never the `Authorization` header, which is a separate
 /// field never interpolated into any log line.
 fn connect_with_retry(key: &str) -> Result<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, String> {
-    let url = format!("{SPEAK_URL}?model={MODEL}&encoding=linear16&sample_rate={SAMPLE_RATE}");
+    let url = format!("{SPEAK_URL}?model={MODEL}&encoding=linear16&sample_rate={SAMPLE_RATE}&expressivity={EXPRESSIVITY}");
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {

@@ -191,12 +191,15 @@ fn non_empty(s: &str) -> Option<String> {
 /// means "not a fast-router case" — the caller falls through to the agent
 /// loop, never an error.
 pub fn try_match(text: &str) -> Option<Capability> {
+    // Bare "stop"/"stop that"/"hold on" are NOT matched here as TaskControl
+    // — they're intercepted upstream, before a turn is even created, by
+    // `crate::interrupt::is_interrupt` (see `veronica::try_interrupt`),
+    // since a bare interruption must never become a visible conversation
+    // turn at all (no "YOU: stop", no "Paused." reply). Anything that
+    // reaches this function has already been confirmed NOT to be a bare
+    // interruption. "pause the task"/"resume"/"cancel that" style genuine
+    // task-control phrasing is still handled below via `verb_family`.
     let stripped = strip_filler(text.trim());
-    let lower_stripped = stripped.trim().to_lowercase();
-    if lower_stripped == "stop" || lower_stripped == "stop that" || lower_stripped == "hold on" {
-        return Some(Capability::TaskControl(TaskControlOp::Pause));
-    }
-
     let (first, second, rest_after_first) = split_verb(stripped);
     if first.is_empty() {
         return None;
@@ -275,9 +278,21 @@ mod tests {
     }
 
     #[test]
-    fn bare_stop_is_task_pause_not_window_close() {
-        assert_eq!(try_match("stop"), Some(Capability::TaskControl(TaskControlOp::Pause)));
-        assert_eq!(try_match("stop that"), Some(Capability::TaskControl(TaskControlOp::Pause)));
+    fn bare_stop_no_longer_fast_routes_here_its_intercepted_upstream_as_an_interrupt() {
+        // See `crate::interrupt::is_interrupt` — a bare "stop"/"stop that"
+        // never reaches `try_match` at all in the real pipeline, since it's
+        // handled as a control signal before a turn is created. `try_match`
+        // itself now has no special case for it, so it simply falls through
+        // (no recognized leading verb) rather than being reinterpreted as a
+        // window-close or anything else.
+        assert_eq!(try_match("stop"), None);
+        assert_eq!(try_match("stop that"), None);
+    }
+
+    #[test]
+    fn explicit_task_control_phrasing_still_fast_routes() {
+        assert_eq!(try_match("pause the task"), Some(Capability::TaskControl(TaskControlOp::Pause)));
+        assert_eq!(try_match("cancel the task"), Some(Capability::TaskControl(TaskControlOp::Cancel)));
     }
 
     #[test]

@@ -291,6 +291,11 @@ body.veronica-widget-window #root {
   color: #fff;
 }
 
+.overlay-mic-mute-button.active {
+  background: rgba(239, 68, 68, 0.85);
+  color: #fff;
+}
+
 /* Veronica's Idle -> Listening -> Thinking -> Speaking cycle: the button
    background follows state (idle keeps the plain "active" red above),
    and the small dot pulses at a pace/color that reads at a glance without

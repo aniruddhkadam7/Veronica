@@ -305,8 +305,12 @@ async fn stream_agentic(
     let mut tool_call_position = 0usize;
 
     while let Some(chunk) = stream.next().await {
+        // See anthropic.rs's `stream_agentic` for why this must be `Err`,
+        // not `Ok(())` — a swallowed-as-success cancellation let a stale,
+        // truncated turn's partial answer get spoken/returned as if it were
+        // the real final answer.
         if cancel.is_cancelled() {
-            return Ok(());
+            return Err("cancelled".to_string());
         }
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));

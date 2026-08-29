@@ -87,6 +87,12 @@ ring = "0.17"
 # device I/O, mirroring how `wasapi` already handles capture-side device I/O
 # in src/audio/.
 rodio = { version = "0.20", default-features = false }
+# Named directly (not only pulled in transitively via rodio) so tts::player
+# can enumerate/select a specific output device by name via HostTrait —
+# rodio re-exports the Device/DeviceTrait bits but not HostTrait. Left
+# unpinned to whatever rodio 0.20 already resolves so cargo doesn't end up
+# with two cpal versions in the dependency tree.
+cpal = "0.15"
 # Deepgram Flux TTS (src/tts/deepgram_flux.rs) talks a persistent
 # `wss://` WebSocket session, not plain HTTP — `tungstenite`'s blocking
 # client (not `tokio-tungstenite`) matches every other network call in this

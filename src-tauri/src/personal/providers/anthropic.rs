@@ -292,8 +292,19 @@ async fn stream_agentic(
         // cancelled mid-stream (barge-in, or a fast follow-up superseding
         // this one) must stop emitting deltas promptly, not once this whole
         // HTTP response happens to finish.
+        //
+        // Returns `Err` (not `Ok(())`) deliberately: an `Ok` here previously
+        // made `run_agent_loop` treat a mid-stream-cancelled turn as a
+        // NORMAL completed answer (no `Done` event ever fired, so
+        // `stop_reason` stayed at its `EndTurn` default and whatever partial
+        // text had streamed so far got spoken/returned as if it were the
+        // real, final answer) — a stale turn racing a newer one instead of
+        // being cleanly superseded. Matching the orchestrator's own
+        // iteration-level cancellation error shape (`"cancelled"`) makes
+        // this the single, consistent way any layer of the loop reports
+        // "this turn was interrupted, not completed."
         if cancel.is_cancelled() {
-            return Ok(());
+            return Err("cancelled".to_string());
         }
         let chunk = chunk.map_err(|e| format!("stream read error: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));

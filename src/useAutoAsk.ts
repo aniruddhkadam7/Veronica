@@ -29,23 +29,22 @@ export interface AskAnswerOptions {
   ttsEnabled: boolean;
 }
 
-export interface PriorTurn {
-  question: string;
-  answer: string;
-}
-
 export interface UseAutoAskConfig {
   /// Which transcript sources feed the buffer — re-read on every segment
   /// (not captured once) so a toggle flipped mid-session (e.g. the
   /// overlay's system-audio switch) takes effect immediately.
   acceptSource: (source: TranscriptSegment["source"]) => boolean;
   answerOptions: () => AskAnswerOptions;
-  getHistory?: () => PriorTurn[];
   /// Called synchronously, right before `ask_veronica` is invoked, with the
-  /// exact question text being sent — e.g. VeronicaOverlay uses this to
-  /// push a new pending turn into its conversation list.
-  onAskStart?: (question: string) => void;
-  onAskSettled?: (question: string, error: unknown) => void;
+  /// exact question text AND the turn_id this call was sent with — e.g.
+  /// VeronicaWidget uses `turnId` to correlate its own (invisible, but
+  /// still real) conversation-history bookkeeping to the right question,
+  /// the same turn_id `ask_veronica`'s events carry — never by "whichever
+  /// question was asked most recently," which breaks the moment two turns
+  /// can be in flight close together (see VeronicaOverlay.tsx's
+  /// `applyTurnEvent` doc for the full story on why that assumption fails).
+  onAskStart?: (question: string, turnId: string) => void;
+  onAskSettled?: (question: string, turnId: string, error: unknown) => void;
 }
 
 export interface UseAutoAskResult {
@@ -65,6 +64,12 @@ export function useAutoAsk(config: UseAutoAskConfig): UseAutoAskResult {
   const committedRef = useRef("");
   const [committedText, setCommittedText] = useState("");
   const safetyTimerRef = useRef<number | null>(null);
+  // Guards against the exact same finalized transcript triggering
+  // ask_veronica twice (requirement 9) — mirrors VeronicaOverlay.tsx's
+  // identical dedup guard on the same underlying risk (a re-delivered Final
+  // segment around a mute/barge-in boundary).
+  const lastDispatchedRef = useRef<{ text: string; at: number } | null>(null);
+  const DEDUPE_WINDOW_MS = 4000;
 
   const setCommitted = useCallback((value: string) => {
     committedRef.current = value;
@@ -81,16 +86,26 @@ export function useAutoAsk(config: UseAutoAskConfig): UseAutoAskResult {
   const dispatch = useCallback(async (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+    const now = Date.now();
+    if (lastDispatchedRef.current && lastDispatchedRef.current.text === trimmed && now - lastDispatchedRef.current.at < DEDUPE_WINDOW_MS) {
+      return;
+    }
+    lastDispatchedRef.current = { text: trimmed, at: now };
     const cfg = configRef.current;
-    cfg.onAskStart?.(trimmed);
+    const turnId = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    cfg.onAskStart?.(trimmed, turnId);
     try {
       const chosenProvider = loadLlmProvider();
       const llmProvider =
         chosenProvider === "anthropic" || chosenProvider === "openai" || chosenProvider === "gemini" ? chosenProvider : null;
       const options = cfg.answerOptions();
+      // No `history` param: ask_veronica derives conversational context
+      // from the shared backend conversation store (see conversation.rs's
+      // `completed_history`) rather than a caller-supplied list — a
+      // follow-up asked here now correctly sees turns from the overlay too.
       await invoke<string>("ask_veronica", {
         question: trimmed,
-        history: cfg.getHistory?.() ?? [],
+        turnId,
         options: {
           answerLength: options.answerLength,
           responseStyle: options.responseStyle,
@@ -99,9 +114,9 @@ export function useAutoAsk(config: UseAutoAskConfig): UseAutoAskResult {
           ttsEnabled: options.ttsEnabled,
         },
       });
-      cfg.onAskSettled?.(trimmed, null);
+      cfg.onAskSettled?.(trimmed, turnId, null);
     } catch (e) {
-      cfg.onAskSettled?.(trimmed, e);
+      cfg.onAskSettled?.(trimmed, turnId, e);
     }
   }, []);
 
@@ -135,8 +150,22 @@ export function useAutoAsk(config: UseAutoAskConfig): UseAutoAskResult {
       const segment = event.payload;
       if (!configRef.current.acceptSource(segment.source)) return;
       if (segment.final_text) {
-        setCommitted(joinSpeech(committedRef.current, segment.final_text));
-        maybeSend();
+        // Interruption check FIRST, before this ever joins the buffer or
+        // becomes a real ask_veronica call (requirement 6) — "stop"/"wait"/
+        // "hold on"/"cancel" is a control signal, never a normal question.
+        // `try_interrupt` both decides AND (if true) stops TTS/cancels the
+        // in-flight turn in one atomic backend call. Only the newly-added
+        // fragment is checked, matching VeronicaOverlay.tsx's identical
+        // guard on this exact backend command.
+        const finalText = segment.final_text;
+        invoke<boolean>("try_interrupt", { text: finalText }).then((wasInterrupt) => {
+          if (wasInterrupt) {
+            clearSafetyTimer();
+            return;
+          }
+          setCommitted(joinSpeech(committedRef.current, finalText));
+          maybeSend();
+        });
       } else if (segment.partial_text) {
         // Still speaking — the safety net must not fire mid-utterance.
         clearSafetyTimer();

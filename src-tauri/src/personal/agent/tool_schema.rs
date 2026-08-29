@@ -108,6 +108,33 @@ pub fn all_tools() -> Vec<ToolSpec> {
     ]
 }
 
+/// A short, human-readable "what Veronica is doing right now" line for one
+/// tool call — shown to the user as a natural progress update (requirement
+/// 11: "show high-level progress, not chain-of-thought"), never the raw
+/// tool name or its JSON arguments. Deliberately present-tense and terse,
+/// matching the style of the example in the spec ("Checking the
+/// authentication code...", "Running tests...").
+pub fn progress_message(name: &str, input: &Value) -> String {
+    let arg = |field: &str| input.get(field).and_then(|v| v.as_str()).map(|s| s.to_string());
+    match name {
+        "launch_or_focus_app" => match arg("name") {
+            Some(app) => format!("Opening {app}..."),
+            None => "Opening that...".to_string(),
+        },
+        "open_path" => match arg("target") {
+            Some(target) => format!("Opening {target}..."),
+            None => "Opening that...".to_string(),
+        },
+        "window_op" => "Adjusting the window...".to_string(),
+        "system_info" => "Checking that...".to_string(),
+        "volume_op" => "Adjusting the volume...".to_string(),
+        "clipboard_op" => "Working with the clipboard...".to_string(),
+        "capture_screen" => "Looking at your screen...".to_string(),
+        "search_knowledge_base" => "Checking your documents...".to_string(),
+        _ => "Working on it...".to_string(),
+    }
+}
+
 fn get_str(input: &Value, field: &str) -> Result<String, String> {
     input.get(field).and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| format!("tool call missing required field \"{field}\""))
 }
@@ -203,6 +230,25 @@ mod tests {
     #[test]
     fn unknown_tool_name_is_an_error() {
         assert!(parse_tool_call("delete_everything", &json!({})).is_err());
+    }
+
+    #[test]
+    fn progress_message_never_leaks_raw_tool_names_or_json() {
+        for (name, input) in [
+            ("launch_or_focus_app", json!({"name": "VS Code"})),
+            ("open_path", json!({"target": "report.pdf"})),
+            ("window_op", json!({"op": "focus"})),
+            ("system_info", json!({"kind": "cpu"})),
+            ("volume_op", json!({"op": "up"})),
+            ("clipboard_op", json!({"op": "read"})),
+            ("capture_screen", json!({})),
+            ("search_knowledge_base", json!({"query": "resume"})),
+            ("some_unknown_tool", json!({"weird": "shape"})),
+        ] {
+            let msg = progress_message(name, &input);
+            assert!(!msg.contains('{'), "progress message for {name} must not contain raw JSON: {msg:?}");
+            assert!(!msg.contains(name) || name == "launch_or_focus_app", "progress message for {name} should not echo the raw tool name: {msg:?}");
+        }
     }
 
     #[test]

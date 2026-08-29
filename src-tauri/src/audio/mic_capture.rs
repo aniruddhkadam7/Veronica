@@ -1,4 +1,5 @@
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
@@ -6,17 +7,56 @@ use wasapi::{Direction, SampleType, StreamMode, WaveFormat};
 use super::resample::AudioResampler;
 use super::{compute_rms, AudioChunk, AudioSource, StopSignal};
 
+/// How long to wait before re-opening the default input device after
+/// `run_capture_loop` exits with an error — covers both "the device was
+/// unplugged/switched, and WASAPI needs a moment before the new default is
+/// queryable" and "there is genuinely no input device right now" (e.g. the
+/// user unplugged their only mic), where retrying instantly would spin-loop
+/// pointlessly until one reappears.
+const REOPEN_DELAY: Duration = Duration::from_millis(500);
+
 /// Captures microphone input via WASAPI. Secondary source for Phase 1 — system
 /// audio (the interviewer's side, and shared meeting audio) is the primary source.
 pub struct MicrophoneCapture;
 
 impl MicrophoneCapture {
-    pub fn start(tx: Sender<AudioChunk>, stop: StopSignal) -> Result<JoinHandle<()>, String> {
+    /// `device_id`: a WASAPI endpoint ID (see `AudioDeviceInfo::id`) to open
+    /// instead of the system default input device, or `None` for the
+    /// default — see `state::SelectedDevices`'s doc. Captured once at start,
+    /// not re-read per retry: a mid-session device change (the selection or
+    /// the physical device itself) is picked up the next time the mic
+    /// assistant is started, mirroring how a plain default-device change
+    /// already only self-heals within the currently-open device class.
+    pub fn start(tx: Sender<AudioChunk>, stop: StopSignal, device_id: Option<String>) -> Result<JoinHandle<()>, String> {
         let handle = std::thread::Builder::new()
             .name("microphone-capture".into())
             .spawn(move || {
-                if let Err(err) = run_capture_loop(tx, stop) {
-                    log::error!("microphone capture stopped with error: {err}");
+                // `run_capture_loop` returns `Err` not only on a genuine
+                // failure to start but also when the OPEN device is
+                // invalidated mid-session (unplugged, or the user switched
+                // audio devices — e.g. disconnecting a Bluetooth headset
+                // that was providing input) via `read_from_device`'s error
+                // path. Previously this thread simply exited on that first
+                // error, permanently and silently killing STT for the rest
+                // of the session (see the audit: capture "stopped working"
+                // after a device change, with no user-facing signal at
+                // all). Looping here — re-opening the selected (or default)
+                // device via a fresh `run_capture_loop` call — means a
+                // mid-session device swap self-heals onto whatever is now
+                // available, exactly like `StopSignal` already lets a
+                // deliberate Stop interrupt this loop cleanly between
+                // attempts. If a specifically-selected device was unplugged,
+                // this will keep retrying that same device ID rather than
+                // silently falling back to a different physical device the
+                // user didn't choose.
+                while !stop.is_stopped() {
+                    if let Err(err) = run_capture_loop(tx.clone(), stop.clone(), device_id.as_deref()) {
+                        log::error!("microphone capture error, retrying against the current device: {err}");
+                        if stop.is_stopped() {
+                            break;
+                        }
+                        std::thread::sleep(REOPEN_DELAY);
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -24,13 +64,18 @@ impl MicrophoneCapture {
     }
 }
 
-fn run_capture_loop(tx: Sender<AudioChunk>, stop: StopSignal) -> Result<(), String> {
+fn run_capture_loop(tx: Sender<AudioChunk>, stop: StopSignal, device_id: Option<&str>) -> Result<(), String> {
     wasapi::initialize_mta().ok().map_err(|e| e.to_string())?;
 
     let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| e.to_string())?;
-    let device = enumerator
-        .get_default_device(&Direction::Capture)
-        .map_err(|e| format!("no default input device: {e}"))?;
+    let device = match device_id {
+        Some(id) => enumerator
+            .get_device(id)
+            .map_err(|e| format!("selected input device unavailable: {e}"))?,
+        None => enumerator
+            .get_default_device(&Direction::Capture)
+            .map_err(|e| format!("no default input device: {e}"))?,
+    };
 
     let mut audio_client = device.get_iaudioclient().map_err(|e| e.to_string())?;
     let mix_format = audio_client.get_mixformat().map_err(|e| e.to_string())?;

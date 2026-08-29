@@ -19,6 +19,15 @@ use super::{compute_rms, AudioChunk, AudioSource, StopSignal};
 /// not to accommodate a slow-but-working init.
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait before re-opening the default output device after
+/// `run_capture_loop` exits with an error partway through an already-started
+/// session (not the initial-start failure, which is reported to the caller
+/// via `ready_tx` instead — see `start_with_metrics`). Mirrors
+/// `mic_capture::REOPEN_DELAY`'s reasoning: bridges the moment after a
+/// device switch/unplug before the new default is queryable, without
+/// spin-looping if no render device is available at all right now.
+const REOPEN_DELAY: Duration = Duration::from_millis(500);
+
 /// Captures Windows system/output audio via WASAPI loopback on the default render
 /// device. This works regardless of which application is producing sound (Chrome,
 /// Edge, Teams, Zoom, Meet, ...) because it taps the shared mix, not any specific
@@ -59,8 +68,35 @@ impl SystemAudioCapture {
         let handle = std::thread::Builder::new()
             .name("system-audio-capture".into())
             .spawn(move || {
-                if let Err(err) = run_capture_loop(tx, stop, metrics, ready_tx) {
-                    log::error!("system audio capture stopped with error: {err}");
+                // `ready_tx` reports only the FIRST attempt's outcome back to
+                // the caller synchronously waiting in `ready_rx.recv_timeout`
+                // below — every later attempt (a mid-session device
+                // swap/unplug self-healing, see `mic_capture`'s identical
+                // fix for why this loops instead of exiting) has no
+                // synchronous caller left to report to, so `ready_tx` is
+                // consumed by the first call and every retry passes `None`.
+                let mut ready_tx = Some(ready_tx);
+                while !stop.is_stopped() {
+                    let this_ready_tx = ready_tx.take();
+                    let had_ready_tx = this_ready_tx.is_some();
+                    if let Err(err) = run_capture_loop(tx.clone(), stop.clone(), metrics.clone(), this_ready_tx) {
+                        log::error!("system audio capture error, retrying against the current default device: {err}");
+                        // An initial-start failure already reported itself
+                        // via `ready_tx` inside `run_capture_loop` — the
+                        // caller below has already given up waiting (or is
+                        // about to), so retrying here would run forever with
+                        // nothing surfacing it. Only self-heal failures that
+                        // happened after a successful start.
+                        if had_ready_tx {
+                            break;
+                        }
+                        if stop.is_stopped() {
+                            break;
+                        }
+                        std::thread::sleep(REOPEN_DELAY);
+                    } else {
+                        break;
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -90,7 +126,10 @@ fn run_capture_loop(
     tx: Sender<AudioChunk>,
     stop: StopSignal,
     metrics: Arc<CaptureMetrics>,
-    ready_tx: mpsc::Sender<Result<(), String>>,
+    // `None` for every retry after the first successful start — see the
+    // call site's doc for why only the initial attempt has a synchronous
+    // caller left to report to.
+    ready_tx: Option<mpsc::Sender<Result<(), String>>>,
 ) -> Result<(), String> {
     let init_result: Result<_, String> = (|| {
         wasapi::initialize_mta().ok().map_err(|e| e.to_string())?;
@@ -129,11 +168,15 @@ fn run_capture_loop(
 
     let (audio_client, capture_client, event_handle, in_rate, in_channels) = match init_result {
         Ok(bits) => {
-            let _ = ready_tx.send(Ok(()));
+            if let Some(ready_tx) = ready_tx {
+                let _ = ready_tx.send(Ok(()));
+            }
             bits
         }
         Err(err) => {
-            let _ = ready_tx.send(Err(err.clone()));
+            if let Some(ready_tx) = ready_tx {
+                let _ = ready_tx.send(Err(err.clone()));
+            }
             return Err(err);
         }
     };

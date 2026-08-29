@@ -38,6 +38,13 @@ const MIN_SPEECH_RMS: f32 = 0.006;
 const NO_SPEECH_PROB_THRESHOLD: f64 = 0.6;
 const AVG_LOGPROB_THRESHOLD: f64 = -1.0;
 
+/// ISO-639-1 code passed as Whisper's `language` hint. English is now the
+/// only supported language (see `language.rs`), so — unlike a multilingual
+/// allowlist, which Whisper's API has no way to express — a single hard
+/// language hint is exactly the right tool here: it biases recognition
+/// toward English with no other-supported-language tradeoff to worry about.
+const LANGUAGE_HINT: &str = "en";
+
 const TRANSCRIPTIONS_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 const MODEL: &str = "whisper-large-v3-turbo";
 
@@ -140,9 +147,15 @@ pub fn transcribe(samples: &[f32], sample_rate: u32) -> Result<String, GroqError
     // exact live-observed failure: a short foreign-language phrase
     // transcribed from silence/noise and then acted on as if the user had
     // said it).
+    //
+    // `language: "en"` biases Whisper toward English — a soft recognition
+    // hint, not a hard filter (it can still transcribe other languages it
+    // hears). See `language.rs` for the actual hard enforcement, which
+    // happens after transcription on the returned text.
     let form = reqwest::blocking::multipart::Form::new()
         .text("model", MODEL)
         .text("response_format", "verbose_json")
+        .text("language", LANGUAGE_HINT)
         .part("file", part);
 
     let response = client

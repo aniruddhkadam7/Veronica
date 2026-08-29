@@ -43,6 +43,15 @@ export interface RecordingStateEvent {
 ///   directive (OpenApp/OpenFile/OpenFolder/OpenUrl/QuerySystemInfo) runs;
 ///   payload is that Intent's fixed Debug label, never model free text.
 /// "veronica:action-complete": () — emitted right after that action finishes.
+/// "veronica:interrupted": () — emitted by the `try_interrupt` command the
+///   instant a bare "stop"/"wait"/"hold on"/"cancel" utterance is recognized
+///   as a dedicated interruption control signal, NOT a normal question — it
+///   never reaches ask_veronica, is never rendered as a "YOU: stop" message,
+///   and never produces a visible "(interrupted)" assistant reply.
+/// "veronica:language-detected": {turnId, language} — informational; which
+///   of the supported classifications ("en"/"unsupported"/"low_confidence")
+///   this turn's transcript was assigned, before the fast router or the LLM
+///   ever see it.
 /// "tts:speaking-changed": boolean — real mute-signal transition from the
 ///   mic-assistant pump (voice_command::mod), which already polls
 ///   TtsSpeakingSignal at mic-chunk cadence to decide whether to withhold
@@ -51,6 +60,11 @@ export interface RecordingStateEvent {
 ///   thread failure with no other path to the frontend: STT sidecar crash/
 ///   error after startup, a per-utterance Groq transcription failure, or a
 ///   per-sentence Deepgram TTS failure.
+/// "tts:audio-level": number — real RMS (0.0-1.0) of the raw PCM chunk Flux
+///   just sent, emitted from TtsSession::speak's on_audio closure before the
+///   chunk is even queued to the player — the lowest-latency point for the
+///   orb's "speaking" animation to react to actual voice output, not a
+///   synthetic/looping animation.
 export type VeronicaErrorEvent = string;
 
 export type BackendStatus = "UNKNOWN" | "CONNECTING" | "CONNECTED" | "OFFLINE";

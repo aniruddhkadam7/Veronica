@@ -35,6 +35,29 @@ use std::sync::{Arc, Mutex};
 use deepgram_flux::FluxSession;
 use player::PlaybackHandle;
 
+/// RMS of a raw linear16 (little-endian i16) PCM chunk, scaled to 0.0-1.0 —
+/// the same 0.0-1.0 meter convention as `audio::compute_rms` (mic capture),
+/// but operating directly on the raw bytes Flux sends rather than decoded
+/// `f32` samples, since this runs on every chunk in the hot `on_audio` path
+/// and a UI level meter doesn't need a second full decode pass or to persist
+/// a leftover odd trailing byte across calls (`player::PcmDecoder` already
+/// does that correctly for the audio actually played; dropping one trailing
+/// byte here, at most once per chunk, is imperceptible for a level meter).
+fn pcm_i16le_rms(bytes: &[u8]) -> f32 {
+    let pairs = bytes.chunks_exact(2);
+    let mut sum_sq = 0f64;
+    let mut count = 0usize;
+    for pair in pairs {
+        let sample = i16::from_le_bytes([pair[0], pair[1]]) as f64 / i16::MAX as f64;
+        sum_sq += sample * sample;
+        count += 1;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    ((sum_sq / count as f64).sqrt() as f32).min(1.0)
+}
+
 /// Ground truth for "is Veronica's own voice coming out of the speakers
 /// right now" — checked by `voice_command::mod`'s mic-assistant pump before
 /// forwarding audio to STT, so Veronica's own TTS output (picked up
@@ -145,7 +168,10 @@ impl TtsSession {
     /// session — a new `TtsSession` is created per answer, but there is only
     /// ever one mic-mute signal.
     pub fn start(speaking: TtsSpeakingSignal, app: Option<tauri::AppHandle>) -> Result<Self, String> {
-        let player = PlaybackHandle::start(speaking.clone())?;
+        let device_name = app
+            .as_ref()
+            .and_then(|app| tauri::Manager::state::<crate::state::AppState>(app).selected_devices.output());
+        let player = PlaybackHandle::start(speaking.clone(), device_name)?;
         Ok(Self {
             player,
             flux: Arc::new(Mutex::new(None)),
@@ -202,12 +228,26 @@ impl TtsSession {
             let app = self.app.clone();
             let stopped_for_audio = stopped.clone();
             let audio_hook = self.on_first_audio_this_turn.clone();
+            let app_for_level = self.app.clone();
             let on_audio = move |chunk: &[u8]| {
                 if stopped_for_audio.load(Ordering::SeqCst) {
                     return;
                 }
                 if let Some(hook) = audio_hook.lock().unwrap().take() {
                     hook();
+                }
+                // Emitted before `enqueue` (not after, and not from the
+                // player thread) so this is the lowest-latency point for the
+                // orb's "speaking" animation to react to real TTS output —
+                // the instant Deepgram's raw PCM arrives over the WebSocket,
+                // same reasoning as `on_first_audio_this_turn` above. A
+                // dedicated event rather than reusing `audio:level`/
+                // `AudioSource`: those tag microphone/system *capture*
+                // sources for STT, and TTS playback isn't a capture source.
+                if let Some(app) = app_for_level.as_ref() {
+                    use tauri::Emitter;
+                    let rms_level = pcm_i16le_rms(chunk);
+                    let _ = app.emit("tts:audio-level", rms_level);
                 }
                 player.enqueue(chunk.to_vec());
             };
