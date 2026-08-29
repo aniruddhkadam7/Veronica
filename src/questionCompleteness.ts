@@ -53,6 +53,23 @@ const TRAILING_INCOMPLETE_WORDS = new Set([
   "are",
   "was",
   "were",
+  // Added for requirement 6/test E ("Create a folder called...") and test B
+  // ("Can you perform some..."): naming/quantifier/determiner words that
+  // virtually always introduce something still to come, not end a sentence.
+  "called",
+  "named",
+  "titled",
+  "some",
+  "any",
+  "few",
+  "couple",
+  "about",
+  "regarding",
+  "my",
+  "your",
+  "this",
+  "these",
+  "those",
 ]);
 
 const TOPIC_SHIFT_OPENERS = ["so", "okay so", "now", "alright"];

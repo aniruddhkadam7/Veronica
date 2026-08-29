@@ -280,6 +280,84 @@ pub fn window_focus(target: Option<&str>) -> Result<String, String> {
     Ok("Done.".to_string())
 }
 
+/// Launches (or focuses) `app`, then opens `arg` with it — e.g. "open VS
+/// Code and open my security project." Backs `Capability::LaunchAppWithArg`.
+/// Most editors/apps that accept a path as their first command-line
+/// argument (VS Code, Notepad, most IDEs) will open it directly; apps that
+/// don't will simply ignore the extra argument, so this still degrades to
+/// "launch/focus the app" rather than failing outright.
+pub fn launch_app_with_arg(app: &str, arg: &str) -> Result<String, String> {
+    let trimmed_app = app.trim();
+    let trimmed_arg = arg.trim();
+    if trimmed_app.is_empty() {
+        return Err("no app name given".into());
+    }
+    let path = resolve_app_path(trimmed_app).ok_or_else(|| format!("I couldn't find an app named \"{trimmed_app}\"."))?;
+    hidden_command(&path)
+        .arg(trimmed_arg)
+        .spawn()
+        .map(|_| format!("Opening {trimmed_app} with {trimmed_arg}."))
+        .map_err(|e| format!("failed to launch \"{trimmed_app}\" with \"{trimmed_arg}\": {e}"))
+}
+
+/// Every visible top-level window's title and owning process id — backs
+/// `Capability::WindowQuery(WindowQueryOp::ListOpen)`. Reuses the same
+/// `EnumWindows` pattern as `find_window_by_title`, generalized to collect
+/// every match instead of stopping at the first.
+pub fn enumerate_visible_windows() -> Result<String, String> {
+    struct CollectCtx {
+        windows: Vec<(String, u32)>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut CollectCtx);
+        if IsWindowVisible(hwnd).as_bool() {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut buf = vec![0u16; len as usize + 1];
+                let read = GetWindowTextW(hwnd, &mut buf);
+                if read > 0 {
+                    let title = String::from_utf16_lossy(&buf[..read as usize]);
+                    let mut pid = 0u32;
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                    ctx.windows.push((title, pid));
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = CollectCtx { windows: Vec::new() };
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut CollectCtx as isize));
+    }
+    if ctx.windows.is_empty() {
+        return Ok("No visible windows found.".to_string());
+    }
+    let listed = ctx.windows.iter().map(|(title, _)| title.as_str()).collect::<Vec<_>>().join(", ");
+    Ok(format!("Open windows: {listed}."))
+}
+
+/// The currently focused window's title — backs
+/// `Capability::WindowQuery(WindowQueryOp::GetActive)`.
+pub fn get_active_window() -> Result<String, String> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return Err("there's no focused window right now".to_string());
+    }
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return Ok("The current window has no title.".to_string());
+    }
+    let mut buf = vec![0u16; len as usize + 1];
+    let read = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    if read <= 0 {
+        return Ok("The current window has no title.".to_string());
+    }
+    let title = String::from_utf16_lossy(&buf[..read as usize]);
+    Ok(format!("The current window is \"{title}\"."))
+}
+
 /// CPU usage via `sysinfo` — same pattern already used by
 /// `hardware::profile`'s hardware-detection pass (two `refresh_cpu_usage()`
 /// calls separated by `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`; sysinfo's CPU
@@ -338,6 +416,14 @@ pub fn query_system_info(kind: &str) -> Result<String, String> {
             }
         }
         "volume" => Err("I can't check the system volume yet.".to_string()),
+        "diskspace" => super::storage::disk_usage(None),
+        "uptime" => {
+            let millis = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
+            let total_seconds = millis / 1000;
+            let hours = total_seconds / 3600;
+            let minutes = (total_seconds % 3600) / 60;
+            Ok(format!("This device has been running for {hours} hours and {minutes} minutes."))
+        }
         other => Err(format!("I don't know how to check \"{other}\".")),
     }
 }

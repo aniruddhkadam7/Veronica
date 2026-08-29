@@ -13,11 +13,12 @@ import {
   type ResponseStyle,
 } from "./overlaySettings";
 import { OverlaySettingsPanel } from "./OverlaySettingsPanel";
-import { classifyQuestionCompleteness, joinSpeech, SAFETY_NET_MS } from "./questionCompleteness";
 import { AudioLevelBars, useSttSpeaking } from "./ui";
 import { ParticlesOrb } from "@/registry/orbe/particles-orb/particles-orb";
-import { loadLlmProvider } from "./llmProviderSetting";
 import { useVeronicaOrbState } from "./useVeronicaOrbState";
+import { useConfirmation } from "./useConfirmation";
+import { ConfirmationDialog } from "./ConfirmationDialog";
+import { useAutoAsk } from "./useAutoAsk";
 
 interface OverlayCaptureStatus {
   excluded: boolean;
@@ -57,15 +58,6 @@ interface Turn {
   status: TurnStatus;
   createdAt: number;
   completedAt?: number;
-}
-
-/// Generates a fresh turn id — `crypto.randomUUID()` is available in the
-/// WebView2 runtime this app ships on; falls back to a timestamp+random
-/// string for any environment where it somehow isn't (matches the shape the
-/// old client-only turn id used).
-function newTurnId(): string {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /// Wire shape of `get_conversation_history`'s result — see
@@ -153,16 +145,10 @@ const OPACITY_MAX = 1;
 /// linger once the user has clearly moved on to typing/talking.
 const WAKE_UP_GLOW_MS = 2500;
 
-/// Window within which an identical submitted question is treated as a
-/// duplicate rather than a genuine repeat — see `askAI`'s dedup guard
-/// (requirement 9). Long enough to absorb a re-delivered Final segment
-/// around a mute/barge-in boundary, short enough that actually repeating
-/// yourself a few seconds later ("did you get that?") still goes through.
-const DEDUPE_WINDOW_MS = 4000;
-
-// The completeness classifier, joinSpeech(), and the bounded safety-net
-// constant live in questionCompleteness.ts, shared with Custom Agents'
-// overlay so both Auto AI implementations behave identically.
+// Live transcript buffering, turn-completeness classification, filler/
+// closed-form suppression, and the dedup guard against a re-delivered Final
+// segment (requirement 9) all live in the shared `useAutoAsk` hook now — see
+// its doc and turnHeuristics.ts's `classifyTurnAction`.
 
 export function VeronicaOverlay() {
   // The whole conversation, oldest first — a local mirror of the ONE shared
@@ -219,44 +205,19 @@ export function VeronicaOverlay() {
   // just say "idle" the instant the greeting line finishes speaking).
   const [justWokeUp, setJustWokeUp] = useState(false);
   const wakeUpTimerRef = useRef<number | null>(null);
+  // Pending Sensitive/Destructive confirmation (see actions::registry's
+  // RiskLevel) — declared early since useAutoAsk's hasPendingConfirmation
+  // config needs to read it. Shared with VeronicaWidget.tsx's equivalent
+  // wiring the same way useVeronicaOrbState is, so either window can
+  // show/resolve it.
+  const { pending: pendingConfirmation, respond: respondToConfirmation } = useConfirmation();
 
   const questionRef = useRef<HTMLTextAreaElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Everything said since the last "Ask AI", as finalized by STT. This is
-  // the buffer that makes the field behave like continuous dictation across
-  // pauses.
-  //
-  // The STT layer finalizes an utterance whenever it hears trailing silence,
-  // and then starts a *fresh* segment for whatever is said next. That is
-  // correct behaviour for a transcript, but the overlay must not treat it as
-  // "the question ended" — a speaker pausing mid-sentence would otherwise have
-  // everything before the pause replaced by the few words after it. So finals
-  // accumulate here and are only cleared by an explicit user action.
-  const committedRef = useRef("");
   // Mirrors `busy` for the event listeners, which close over stale state
   // otherwise. Answer deltas must keep landing regardless of re-renders.
   const busyRef = useRef(false);
   const hintTimerRef = useRef<number | null>(null);
-  // Safety-net timer: only armed when the buffered text still looks
-  // incomplete after a Final (see the transcript listener below) — a
-  // complete-looking Final sends immediately, with no timer at all. Lives
-  // in a ref (not state) since it's set/cleared from the transcript
-  // listener, which must not re-subscribe on every keystroke-equivalent
-  // state change.
-  const autoAiTimerRef = useRef<number | null>(null);
-  // askAI changes identity on every render; mirrored into a ref so the
-  // transcript listener (subscribed once, on mount) always calls the latest
-  // version instead of one captured at effect-setup time.
-  const askAIRef = useRef<() => void>(() => {});
-  // The exact text of the most recent turn actually SUBMITTED to
-  // ask_veronica, plus when — guards against the same finalized transcript
-  // triggering a second request (requirement 9). The local VAD/STT sidecar
-  // can occasionally re-emit the same Final segment (e.g. a flush around a
-  // mute/barge-in boundary), and this must never turn into two identical
-  // conversation turns. A short time window (not "forever") so a genuine
-  // repeat later in the conversation ("play it again", asked twice minutes
-  // apart) is never silently swallowed.
-  const lastSubmittedRef = useRef<{ text: string; at: number } | null>(null);
   // The turn_id of whichever turn was started MOST RECENTLY — used only to
   // decide whether an incoming event should update `busy`/`error` UI state
   // (a stale, superseded turn's own completion must not stomp on whatever
@@ -264,6 +225,10 @@ export function VeronicaOverlay() {
   // consult this — they're correlated purely by matching the event's own
   // turnId against a turn in `turns`, via `applyTurnEvent`.
   const activeTurnIdRef = useRef<string | null>(null);
+  // Mirrors useAutoAsk's clearBuffer — needed by the overlay:reset-session
+  // effect, which is declared before the useAutoAsk(...) call below (which
+  // must come after the state it reads, e.g. pendingConfirmation).
+  const clearBufferRef = useRef<() => void>(() => {});
 
   useEffect(
     () => () => {
@@ -276,95 +241,14 @@ export function VeronicaOverlay() {
     saveOverlaySettings(settings);
   }, [settings]);
 
-  // Live transcript feed: reuse the exact same "transcript:update" event the
-  // main window listens to (see App.tsx) — both windows share the same Rust
-  // backend process/state, so no separate capture pipeline is needed here.
-  //
-  // This behaves like continuous dictation. There is deliberately no
-  // sentence-end detection beyond `classifyQuestionCompleteness`, and
-  // nothing that clears the field on silence: a `Final` transcript segment
-  // is the real turn-completion signal (the local VAD already decided the
-  // utterance ended — see stt/sidecar.rs), so a complete-looking Final is
-  // sent the instant it arrives, with no added wait. Only a Final that
-  // still looks incomplete (trails off on "and", a dangling comma) arms a
-  // short bounded safety-net timer instead of sending immediately — sending
-  // a bare fragment straight to the fast router risks it matching a real,
-  // possibly irreversible, command out of context; the safety net only
-  // fires if the speaker trails off and nothing more arrives to merge with.
+  // Live transcript feed, turn-completeness classification, filler/dedup
+  // suppression, and turn submission itself all live in the shared
+  // `useAutoAsk` hook (see its doc) — the SAME hook VeronicaWidget.tsx uses,
+  // so both windows behave identically instead of maintaining two
+  // hand-rolled copies that could drift apart. Wired up below, after this
+  // effect (which keeps only the answer-delta/-complete/-interrupted
+  // listeners — turn CONTENT events, not turn SUBMISSION).
   useEffect(() => {
-    const clearAutoAiTimer = () => {
-      if (autoAiTimerRef.current) {
-        window.clearTimeout(autoAiTimerRef.current);
-        autoAiTimerRef.current = null;
-      }
-    };
-
-    const armAutoAiTimer = () => {
-      clearAutoAiTimer();
-      // No `busyRef` gate here anymore: a new complete-looking utterance
-      // starts its own turn immediately, even while a previous one is still
-      // THINKING/streaming/speaking — exactly like a real conversation,
-      // where you can start talking again before the other person finishes.
-      // The backend (`AppState::begin_turn`) cancels whatever the previous
-      // turn was still doing the moment this new one starts, and every
-      // event this new turn's `ask_veronica` call emits carries ITS OWN
-      // turn_id — so the two can never cross streams no matter how they
-      // overlap in time (see `applyTurnEvent`).
-      if (classifyQuestionCompleteness(committedRef.current) === "complete") {
-        askAIRef.current();
-        return;
-      }
-      autoAiTimerRef.current = window.setTimeout(() => {
-        autoAiTimerRef.current = null;
-        askAIRef.current();
-      }, SAFETY_NET_MS);
-    };
-
-    const unlistenTranscript = listen<TranscriptSegment>("transcript:update", (event) => {
-      const segment = event.payload;
-      // The user's own voice (microphone) always feeds the question box —
-      // mic listening is always on for the whole session. System audio (the
-      // other speaker/app sound) only does while the header's toggle is on
-      // — see toggleSystemAudio — so it stays silent by default.
-      if (segment.source === "SYSTEM_AUDIO" && !systemAudioActiveRef.current) return;
-      if (segment.source !== "SYSTEM_AUDIO" && segment.source !== "MICROPHONE") return;
-      // While an answer is streaming, keep buffering finals silently: the
-      // user may already be asking the next question. They land in the
-      // field, not in the answer that's still arriving.
-      if (segment.final_text) {
-        console.debug("[TRANSCRIPT_FINAL]", segment.final_text);
-        const candidate = joinSpeech(committedRef.current, segment.final_text);
-        // Interruption check FIRST, before this ever becomes a buffered
-        // question or a Turn (requirement 6): "stop"/"wait"/"hold on"/
-        // "cancel" must never appear as a "YOU: stop" message and must
-        // never produce a visible assistant reply. `try_interrupt` is a
-        // single atomic backend call — it both decides AND (if true) stops
-        // TTS/cancels the in-flight turn, so there's no separate detect-
-        // then-act race. Only the newly-added fragment is checked (not the
-        // whole buffer) so an interruption said cleanly on its own always
-        // matches, even if something was left over in the composer.
-        invoke<boolean>("try_interrupt", { text: segment.final_text }).then((wasInterrupt) => {
-          if (wasInterrupt) {
-            // Clear the composer too — an interruption is a control signal,
-            // never conversation content left sitting in the input.
-            committedRef.current = "";
-            setQuestion("");
-            clearAutoAiTimer();
-            return;
-          }
-          committedRef.current = candidate;
-          setQuestion(committedRef.current);
-          armAutoAiTimer();
-        });
-      } else if (segment.partial_text) {
-        console.debug("[TRANSCRIPT_INTERIM]", segment.partial_text);
-        setQuestion(joinSpeech(committedRef.current, segment.partial_text));
-        // Still speaking — any timer counting down from an earlier final must
-        // not fire mid-sentence.
-        clearAutoAiTimer();
-      }
-    });
-
     // Correlated by turn_id (see the `Turn`/`applyTurnEvent` doc above), NOT
     // by array position — this is the actual fix for the live-observed bug
     // where one turn's real answer landed on a DIFFERENT (later) turn's
@@ -417,11 +301,9 @@ export function VeronicaOverlay() {
     });
 
     return () => {
-      unlistenTranscript.then((f) => f());
       unlistenDelta.then((f) => f());
       unlistenComplete.then((f) => f());
       unlistenInterrupted.then((f) => f());
-      clearAutoAiTimer();
     };
   }, []);
 
@@ -509,12 +391,10 @@ export function VeronicaOverlay() {
   // Rust side emits this right before re-showing an existing window.
   useEffect(() => {
     const unlistenReset = listen("overlay:reset-session", () => {
-      setQuestion("");
       setError(null);
       setConfirmingClose(false);
       setSettingsOpen(false);
-      committedRef.current = "";
-      lastSubmittedRef.current = null;
+      clearBufferRef.current();
       invoke<boolean>("get_mic_muted")
         .then(setMicMuted)
         .catch(() => {});
@@ -533,99 +413,78 @@ export function VeronicaOverlay() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [turns, question]);
 
-  const askAI = useCallback(async () => {
-    const trimmed = question.trim();
-    if (!trimmed) return;
-
-    // Deduplication (requirement 9): the exact same finalized transcript
-    // must never trigger two ask_veronica calls. Guards the case a Final
-    // segment is effectively re-delivered (e.g. a sidecar flush around a
-    // mute/barge-in boundary re-sends what was already sent) rather than
-    // representing a genuine new utterance. Scoped to a short window, not
-    // forever — asking the identical question again later in the
-    // conversation is a normal, real thing to do.
-    const now = Date.now();
-    if (lastSubmittedRef.current && lastSubmittedRef.current.text === trimmed && now - lastSubmittedRef.current.at < DEDUPE_WINDOW_MS) {
-      setQuestion("");
-      committedRef.current = "";
-      return;
-    }
-    lastSubmittedRef.current = { text: trimmed, at: now };
-
-    setError(null);
-    // This turn's id is generated HERE, once, and used as both the React
-    // key and the id ask_veronica's events are keyed by — a single
-    // identity end to end, not a client-only id plus positional lookups.
-    // No `busyRef` check: a new turn is allowed to start even while a
-    // previous one is still active (THINKING/streaming/speaking) — the
-    // backend cancels the previous turn's generation the instant this one
-    // starts (`AppState::begin_turn`), and `applyTurnEvent`'s turn_id
-    // correlation means the two can never cross wires no matter how they
-    // overlap. This IS what makes "start talking again before Veronica
-    // finishes" (barge-in / a fast follow-up) work naturally instead of
-    // being silently dropped.
-    const turnId = newTurnId();
-    console.debug("[TURN_SUBMITTED]", turnId, trimmed);
-    activeTurnIdRef.current = turnId;
-    const turn: Turn = { id: turnId, question: trimmed, answer: "", status: "thinking", createdAt: Date.now() };
-    setTurns((prev) => [...prev, turn]);
-    setQuestion("");
-    committedRef.current = "";
-    busyRef.current = true;
-    setBusy(true);
-
-    try {
-      const chosenProvider = loadLlmProvider();
-      const llmProvider =
-        chosenProvider === "anthropic" || chosenProvider === "openai" || chosenProvider === "gemini"
-          ? chosenProvider
-          : null;
-      // ask_veronica either answers directly or, when the request is
-      // asking it to do something (open an app/file/folder/URL, check
-      // simple system info), runs that action server-side and returns its
-      // result instead — see veronica::ask_veronica and
-      // personal/prompts/veronica.rs's ACTION-TAKING section. There is no
-      // separate "is this a command" step here: every question goes
-      // through the same call, and the backend decides. Turn finalization
-      // (success, interrupted, or error) always happens via the
-      // `veronica:answer-complete` event listener above, which the backend
-      // guarantees fires on every path — this call's own rejection below is
-      // only used to surface a top-level error banner, not to mutate turn
-      // state a second time.
-      //
-      // No `history` param: ask_veronica derives conversational context
-      // from the shared backend conversation store itself (see
-      // conversation.rs's `completed_history`), not from whatever this one
-      // window happens to have in its own local `turns` — a follow-up asked
-      // here now correctly sees turns that happened through the widget too.
-      await invoke<string>("ask_veronica", {
-        question: trimmed,
-        turnId,
-        options: {
-          answerLength: settings.answerLength,
-          responseStyle: settings.responseStyle,
-          humanization: settings.humanization,
-          llmProvider,
-          ttsEnabled: settings.voiceOutputEnabled,
-        },
-      });
-    } catch (e) {
-      // "cancelled" means a newer turn superseded this one before it
-      // finished — expected/normal (see veronica.rs), not a real failure,
-      // so no error banner for it.
-      if (String(e) !== "cancelled") {
-        setError(String(e));
+  // Turn-completeness classification, filler/closed-form suppression, live
+  // partial-arrival gating, transcript buffering, and the actual
+  // ask_veronica dispatch all live here now — the SAME hook
+  // VeronicaWidget.tsx uses, so both windows share one turn-boundary state
+  // machine instead of two hand-maintained copies that could drift apart
+  // and independently double-submit the same utterance (requirement 9).
+  const { askNow, setBuffer, clearBuffer } = useAutoAsk({
+    acceptSource: useCallback(
+      (source: TranscriptSegment["source"]) => source === "MICROPHONE" || (source === "SYSTEM_AUDIO" && systemAudioActiveRef.current),
+      [],
+    ),
+    answerOptions: useCallback(
+      () => ({
+        answerLength: settings.answerLength,
+        responseStyle: settings.responseStyle,
+        humanization: settings.humanization,
+        ttsEnabled: settings.voiceOutputEnabled,
+      }),
+      [settings],
+    ),
+    hasPendingConfirmation: useCallback(() => pendingConfirmation !== null, [pendingConfirmation]),
+    onBufferChange: setQuestion,
+    // This turn's id is generated by the hook and used as both the React
+    // key and the id ask_veronica's events are keyed by — a single identity
+    // end to end, not a client-only id plus positional lookups. No busyRef
+    // gate: a new turn is allowed to start even while a previous one is
+    // still active (THINKING/streaming/speaking) — the backend cancels the
+    // previous turn's generation the instant this one starts
+    // (`AppState::begin_turn`), and `applyTurnEvent`'s turn_id correlation
+    // means the two can never cross wires no matter how they overlap. This
+    // IS what makes "start talking again before Veronica finishes"
+    // (barge-in / a fast follow-up) work naturally instead of being
+    // silently dropped.
+    onAskStart: useCallback((trimmed: string, turnId: string) => {
+      console.debug("[TURN_SUBMITTED]", turnId, trimmed);
+      activeTurnIdRef.current = turnId;
+      setError(null);
+      const turn: Turn = { id: turnId, question: trimmed, answer: "", status: "thinking", createdAt: Date.now() };
+      setTurns((prev) => [...prev, turn]);
+      busyRef.current = true;
+      setBusy(true);
+    }, []),
+    // Turn finalization (success, interrupted, or error) always happens via
+    // the `veronica:answer-complete` event listener above, which the
+    // backend guarantees fires on every path — this settle callback is only
+    // used to surface a top-level error banner, not to mutate turn state a
+    // second time.
+    onAskSettled: useCallback((_question: string, turnId: string, error: unknown) => {
+      if (error != null) {
+        // "cancelled" (a newer turn superseded this one) and "duplicate
+        // question already in flight" (the backend's own idempotency guard,
+        // see AppState::try_claim_ask) are both expected/normal, not real
+        // failures — no error banner for either.
+        const message = String(error);
+        if (message !== "cancelled" && message !== "duplicate question already in flight") {
+          setError(message);
+        }
       }
       if (turnId === activeTurnIdRef.current) {
         busyRef.current = false;
         setBusy(false);
       }
-    }
-  }, [question, turns, settings]);
+    }, []),
+  });
+
+  const askAI = useCallback(() => {
+    askNow(question);
+  }, [askNow, question]);
 
   useEffect(() => {
-    askAIRef.current = askAI;
-  }, [askAI]);
+    clearBufferRef.current = clearBuffer;
+  }, [clearBuffer]);
 
   // Hides the overlay window ONLY — the conversation and the mic-assistant
   // session both keep running exactly as they were (App.tsx's Stop button
@@ -638,11 +497,6 @@ export function VeronicaOverlay() {
   // there is nothing to proactively clear here even for tidiness.
   const closeOverlay = useCallback(async () => {
     setConfirmingClose(false);
-
-    if (autoAiTimerRef.current) {
-      window.clearTimeout(autoAiTimerRef.current);
-      autoAiTimerRef.current = null;
-    }
     setError(null);
 
     // System audio (the other speaker/app sound) is this window's own
@@ -745,11 +599,13 @@ export function VeronicaOverlay() {
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       // Adopt the user's text as the new buffer. Without this, a later
       // utterance would append onto the pre-edit text and silently undo their
-      // correction.
-      committedRef.current = e.target.value;
+      // correction. setBuffer also triggers onBufferChange (which calls
+      // setQuestion), but the direct call here keeps typing latency at zero
+      // rather than waiting on a hook round-trip.
+      setBuffer(e.target.value);
       setQuestion(e.target.value);
     },
-    [],
+    [setBuffer],
   );
 
   // Runs after every render where `question` changed — covers typing, STT
@@ -957,6 +813,13 @@ export function VeronicaOverlay() {
           ⚠ Screen capture protection unavailable — this window may be visible if you share your screen
         </p>
       )}
+
+      {/* Rendered even alongside the normal chat view below (not swapped in
+          for it, unlike settingsOpen/confirmingClose) so a pending
+          confirmation stays visible without hiding the conversation that led
+          to it — the user should be able to see what they asked right above
+          the yes/no prompt. */}
+      {pendingConfirmation && <ConfirmationDialog pending={pendingConfirmation} onRespond={respondToConfirmation} />}
 
       {confirmingClose ? (
         <div className="overlay-confirm-close">

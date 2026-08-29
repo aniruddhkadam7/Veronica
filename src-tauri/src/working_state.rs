@@ -55,6 +55,29 @@ impl WorkingState {
         self.last_result = Some(result.into());
     }
 
+    /// Updates whichever of `current_app`/`current_window`/`current_file`/
+    /// `current_folder` the caller provides `Some` for — `None` fields are
+    /// left untouched, so an action that only touches a file doesn't
+    /// clobber a previously-recorded app/window. Fed by
+    /// `actions::context::derive_context_updates`, called right after
+    /// `record_action` at every dispatch site (fast router + agent loop) so
+    /// "it"/"that file"/"this folder" resolve against whatever was actually
+    /// last touched, regardless of which path executed it.
+    pub fn note_context(&mut self, app: Option<String>, window: Option<String>, file: Option<String>, folder: Option<String>) {
+        if let Some(v) = app {
+            self.current_app = Some(v);
+        }
+        if let Some(v) = window {
+            self.current_window = Some(v);
+        }
+        if let Some(v) = file {
+            self.current_file = Some(v);
+        }
+        if let Some(v) = folder {
+            self.current_folder = Some(v);
+        }
+    }
+
     /// Starts (replacing any previous) multi-step task, `Active` from the
     /// start.
     pub fn start_task(&mut self, goal: impl Into<String>) {
@@ -177,6 +200,28 @@ mod tests {
         let mut ws = WorkingState::default();
         ws.pause_task(); // no task at all
         assert!(ws.current_task.is_none());
+    }
+
+    #[test]
+    fn note_context_only_overwrites_provided_fields() {
+        let mut ws = WorkingState::default();
+        ws.note_context(Some("VS Code".to_string()), None, None, None);
+        assert_eq!(ws.current_app.as_deref(), Some("VS Code"));
+        assert_eq!(ws.current_file, None);
+
+        ws.note_context(None, None, Some("notes.txt".to_string()), None);
+        assert_eq!(ws.current_app.as_deref(), Some("VS Code"), "unrelated update must not clear a previously-set field");
+        assert_eq!(ws.current_file.as_deref(), Some("notes.txt"));
+    }
+
+    #[test]
+    fn context_block_reflects_the_most_recently_opened_file_across_two_sequential_calls() {
+        let mut ws = WorkingState::default();
+        ws.note_context(None, None, Some("first.txt".to_string()), None);
+        ws.note_context(None, None, Some("second.txt".to_string()), None);
+        let block = ws.render_context_block().unwrap();
+        assert!(block.contains("second.txt"));
+        assert!(!block.contains("first.txt"));
     }
 
     #[test]

@@ -14,12 +14,31 @@
 //! rail.
 
 use base64::Engine;
+use tauri::{AppHandle, Runtime};
 
-use crate::actions::{self, ToolOutcome};
+use crate::actions::{self, RiskLevel, ToolOutcome};
 use crate::state::CancelToken;
+use crate::working_state::WorkingState;
 
 use super::tool_schema::{self, ToolSpec};
 use super::types::{AgentContent, AgentEvent, AgentMessage, StopReason};
+
+/// A `Sensitive`/`Destructive` tool call the loop paused on — packaged by
+/// `run_agent_loop` when `execute_one_tool_call` reports
+/// `ToolCallOutcome::NeedsConfirmation`. `veronica::run_turn` stores this
+/// (as `veronica::PendingConfirmation`, which wraps the same fields plus a
+/// `turn_id`) and, once the user answers, resumes the loop by appending a
+/// `ToolResult` for `tool_use_id` to `messages` and calling `run_agent_loop`
+/// again — no separate resume code path, just feeding the paused loop one
+/// more message.
+#[derive(Debug, Clone)]
+pub struct PendingToolConfirmation {
+    pub capability: actions::Capability,
+    pub risk: RiskLevel,
+    pub voice_prompt: String,
+    pub tool_use_id: String,
+    pub tool_name: String,
+}
 
 /// Prevents a genuinely runaway tool-calling loop (a model that keeps
 /// calling tools forever without ever settling on a final answer) from
@@ -35,6 +54,19 @@ pub struct AgentOutcome {
     /// into `WorkingState.recent_actions` by the caller.
     pub actions_taken: Vec<String>,
     pub iterations_used: usize,
+    /// `Some` when the loop stopped early because a tool call needs user
+    /// confirmation before it can run — see `PendingToolConfirmation`. The
+    /// caller (`veronica::run_turn`) speaks/shows `voice_prompt` as this
+    /// turn's answer instead of `final_text`, and stashes `messages` (the
+    /// accumulated history INCLUDING the assistant's `ToolUse` for the
+    /// paused call, but no `ToolResult` for it yet) to resume from once the
+    /// user answers.
+    pub pending_confirmation: Option<PendingToolConfirmation>,
+    /// The accumulated message history at the point the loop stopped —
+    /// returned unconditionally (cheap, already owned) so a caller handling
+    /// `pending_confirmation` doesn't need a second return shape to resume
+    /// from.
+    pub messages: Vec<AgentMessage>,
 }
 
 /// One provider call for one iteration of the loop — implemented by each of
@@ -72,11 +104,14 @@ pub trait AgenticProvider: Send + Sync {
 /// exactly like `DirectLlmClient::ask_stream`'s callback — so the caller can
 /// feed it straight into `veronica:answer-delta` events and the TTS
 /// chunker, unchanged from how a plain (non-agentic) answer already streams.
-pub async fn run_agent_loop(
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_loop<R: Runtime>(
     provider: &dyn AgenticProvider,
     mut messages: Vec<AgentMessage>,
     cancel: &CancelToken,
     turn_id: &str,
+    working_context: &WorkingState,
+    app: &AppHandle<R>,
     mut on_text_delta: impl FnMut(&str) + Send,
     mut on_progress: impl FnMut(&str) + Send,
 ) -> Result<AgentOutcome, String> {
@@ -168,9 +203,30 @@ pub async fn run_agent_loop(
                 return Err("cancelled".to_string());
             }
             on_progress(&tool_schema::progress_message(&name, &input));
-            let (text, image, is_error) = execute_one_tool_call(&name, &input).await;
-            actions_taken.push(format!("{name}({input}) -> {text}"));
-            results.push(AgentContent::ToolResult { tool_use_id: id, text, image, is_error });
+            match execute_one_tool_call(&name, &input, working_context, app).await {
+                ToolCallOutcome::Done { text, image, is_error } => {
+                    actions_taken.push(format!("{name}({input}) -> {text}"));
+                    results.push(AgentContent::ToolResult { tool_use_id: id, text, image, is_error });
+                }
+                ToolCallOutcome::NeedsConfirmation { capability, risk, voice_prompt } => {
+                    // Pause here: do NOT append a ToolResult for this call
+                    // (there isn't one yet), and drop any remaining calls in
+                    // this batch — the model will re-ask for them once the
+                    // loop resumes, since resuming re-enters with the
+                    // confirmed result as the only new input. `messages`
+                    // already has the assistant's ToolUse turn (pushed
+                    // above) but no ToolResult for `id` — exactly the shape
+                    // the resume path needs to append one to.
+                    log::info!("[CONFIRMATION_NEEDED] turn_id={turn_id} tool={name} risk={risk:?}");
+                    return Ok(AgentOutcome {
+                        final_text,
+                        actions_taken,
+                        iterations_used,
+                        pending_confirmation: Some(PendingToolConfirmation { capability, risk, voice_prompt, tool_use_id: id, tool_name: name }),
+                        messages,
+                    });
+                }
+            }
         }
         // UPDATE STATE: the tool results become the next iteration's input,
         // which is what lets the model DECIDE NEXT ACTION from what it just
@@ -179,20 +235,26 @@ pub async fn run_agent_loop(
     }
 
     log::info!("[LLM_COMPLETE] turn_id={turn_id} agent loop done — iterations_used={iterations_used} actions_taken={}", actions_taken.len());
-    Ok(AgentOutcome { final_text, actions_taken, iterations_used })
+    Ok(AgentOutcome { final_text, actions_taken, iterations_used, pending_confirmation: None, messages })
 }
 
-async fn execute_one_tool_call(name: &str, input: &serde_json::Value) -> (String, Option<(&'static str, String)>, bool) {
-    match tool_schema::parse_tool_call(name, input) {
-        Ok(capability) => match actions::execute_tool(&capability).await {
-            Ok(ToolOutcome::Text(text)) => (text, None, false),
+enum ToolCallOutcome {
+    Done { text: String, image: Option<(&'static str, String)>, is_error: bool },
+    NeedsConfirmation { capability: actions::Capability, risk: RiskLevel, voice_prompt: String },
+}
+
+async fn execute_one_tool_call<R: Runtime>(name: &str, input: &serde_json::Value, working_context: &WorkingState, app: &AppHandle<R>) -> ToolCallOutcome {
+    match tool_schema::parse_tool_call(name, input, working_context) {
+        Ok(capability) => match actions::verification::execute_and_verify(&capability, false, app).await {
+            Ok(ToolOutcome::Text(text)) => ToolCallOutcome::Done { text, image: None, is_error: false },
             Ok(ToolOutcome::Image { media_type, png_bytes }) => {
                 let data_base64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
-                ("Screenshot captured.".to_string(), Some((media_type, data_base64)), false)
+                ToolCallOutcome::Done { text: "Screenshot captured.".to_string(), image: Some((media_type, data_base64)), is_error: false }
             }
-            Err(err) => (err, None, true),
+            Ok(ToolOutcome::NeedsConfirmation { capability, risk, voice_prompt }) => ToolCallOutcome::NeedsConfirmation { capability, risk, voice_prompt },
+            Err(err) => ToolCallOutcome::Done { text: err, image: None, is_error: true },
         },
-        Err(err) => (err, None, true),
+        Err(err) => ToolCallOutcome::Done { text: err, image: None, is_error: true },
     }
 }
 
@@ -246,6 +308,16 @@ mod tests {
         }
     }
 
+    /// A real `AppHandle` backed by `tauri::test`'s mock runtime — lets
+    /// these tests exercise `run_agent_loop`/`execute_one_tool_call` (which
+    /// need one to reach `AppState` for `SchedulerOp`/`WatcherOp`) without a
+    /// full running app.
+    fn mock_app_handle() -> tauri::AppHandle<tauri::test::MockRuntime> {
+        let app = tauri::test::mock_app();
+        tauri::Manager::manage(&app, crate::state::AppState::default());
+        app.handle().clone()
+    }
+
     // Plain `#[test]` + `tauri::async_runtime::block_on` throughout (rather
     // than `#[tokio::test]`) since this crate's `tokio` dependency only
     // enables the `time` feature, not `macros`/`rt` — this matches how the
@@ -258,8 +330,9 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let provider = text_only_provider("Hello there.");
             let cancel = CancelToken::new();
+            let app = mock_app_handle();
             let mut collected = String::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", |d| collected.push_str(d), |_| {})
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", &WorkingState::default(), &app, |d| collected.push_str(d), |_| {})
                 .await
                 .unwrap();
             assert_eq!(outcome.final_text, "Hello there.");
@@ -283,7 +356,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let cancel = CancelToken::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", |_| {}, |_| {}).await.unwrap();
+            let app = mock_app_handle();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {}).await.unwrap();
             assert_eq!(outcome.iterations_used, 2);
             assert_eq!(outcome.final_text, "It's now.");
             assert_eq!(outcome.actions_taken.len(), 1);
@@ -303,7 +377,8 @@ mod tests {
             };
             let cancel = CancelToken::new();
             cancel.cancel();
-            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", |_| {}, |_| {}).await;
+            let app = mock_app_handle();
+            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("what time is it")], &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {}).await;
             assert!(result.is_err());
         });
     }
@@ -340,8 +415,9 @@ mod tests {
         tauri::async_runtime::block_on(async {
             let provider = CancelsMidStreamProvider;
             let cancel = CancelToken::new();
+            let app = mock_app_handle();
             let mut collected = String::new();
-            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", |d| collected.push_str(d), |_| {}).await;
+            let result = run_agent_loop(&provider, vec![AgentMessage::user_text("hi")], &cancel, "test-turn", &WorkingState::default(), &app, |d| collected.push_str(d), |_| {}).await;
             assert!(result.is_err(), "a mid-stream cancellation must surface as an Err, never Ok(partial_text)");
             assert_eq!(result.unwrap_err(), "cancelled");
             // The delta DID reach the caller as it streamed (that's correct
@@ -368,7 +444,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
             };
             let cancel = CancelToken::new();
-            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("loop forever")], &cancel, "test-turn", |_| {}, |_| {}).await.unwrap();
+            let app = mock_app_handle();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("loop forever")], &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {}).await.unwrap();
             assert_eq!(outcome.iterations_used, MAX_ITERATIONS);
             assert_eq!(provider.calls.load(Ordering::SeqCst), MAX_ITERATIONS);
         });
@@ -376,7 +453,138 @@ mod tests {
 
     #[test]
     fn execute_one_tool_call_reports_unknown_tool_as_an_error_result() {
-        let result = tauri::async_runtime::block_on(execute_one_tool_call("not_a_real_tool", &serde_json::json!({})));
-        assert!(result.2, "unknown tool should be reported as an error result, not silently ignored");
+        let app = mock_app_handle();
+        let result = tauri::async_runtime::block_on(execute_one_tool_call("not_a_real_tool", &serde_json::json!({}), &WorkingState::default(), &app));
+        assert!(matches!(result, ToolCallOutcome::Done { is_error: true, .. }), "unknown tool should be reported as an error result, not silently ignored");
+    }
+
+    /// Confirmation flow: a `Destructive` tool call must pause the loop
+    /// rather than executing it or treating the pause as a normal
+    /// `ToolResult`.
+    #[test]
+    fn a_destructive_tool_call_pauses_the_loop_with_no_premature_tool_result() {
+        let dir = std::env::temp_dir().join(format!("veronica_test_orch_confirm_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        tauri::async_runtime::block_on(async {
+            let provider = ScriptedProvider {
+                batches: std::sync::Mutex::new(vec![vec![
+                    AgentEvent::ToolCallReady {
+                        id: "1".to_string(),
+                        name: "delete_file".to_string(),
+                        input: serde_json::json!({"path": file.to_str().unwrap()}),
+                    },
+                    AgentEvent::Done { stop_reason: StopReason::ToolUse },
+                ]]),
+                calls: AtomicUsize::new(0),
+            };
+            let cancel = CancelToken::new();
+            let app = mock_app_handle();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("delete that file")], &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {})
+                .await
+                .unwrap();
+
+            let pending = outcome.pending_confirmation.expect("expected a pending confirmation");
+            assert_eq!(pending.tool_name, "delete_file");
+            assert_eq!(pending.risk, RiskLevel::Destructive);
+            // The assistant's ToolUse turn was appended, but no ToolResult
+            // for it yet — exactly the shape the resume path needs.
+            let last = outcome.messages.last().unwrap();
+            assert!(matches!(last.content.last(), Some(AgentContent::ToolUse { .. })));
+            assert!(file.exists(), "the file must not actually be deleted while the confirmation is pending");
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Resuming: append a synthetic `ToolResult` for the paused call (as if
+    /// the user just confirmed) and re-invoke `run_agent_loop` with the
+    /// returned `messages` — the loop should continue normally from there,
+    /// which is the whole resume mechanism (no separate resume API).
+    #[test]
+    fn resuming_after_confirmation_continues_the_loop_from_the_paused_point() {
+        tauri::async_runtime::block_on(async {
+            let mut messages = vec![AgentMessage::user_text("delete that file")];
+            messages.push(AgentMessage::assistant(vec![AgentContent::ToolUse {
+                id: "1".to_string(),
+                name: "delete_file".to_string(),
+                input: serde_json::json!({"path": "x.txt"}),
+            }]));
+            // Simulates what veronica::run_turn does on "yes": append the
+            // now-confirmed result, then resume.
+            messages.push(AgentMessage::tool_results(vec![AgentContent::ToolResult {
+                tool_use_id: "1".to_string(),
+                text: "Sent \"x.txt\" to the Recycle Bin.".to_string(),
+                image: None,
+                is_error: false,
+            }]));
+
+            let provider = text_only_provider("Done — it's deleted.");
+            let cancel = CancelToken::new();
+            let app = mock_app_handle();
+            let outcome = run_agent_loop(&provider, messages, &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {}).await.unwrap();
+            assert_eq!(outcome.final_text, "Done — it's deleted.");
+            assert!(outcome.pending_confirmation.is_none());
+        });
+    }
+
+    /// Pause/resume/cancel interaction: if the token backing a paused
+    /// confirmation gets cancelled (a newer, unrelated turn superseded it)
+    /// before the user answers, resuming must refuse rather than silently
+    /// running a stale task against a dead token.
+    #[test]
+    fn cancellation_during_a_pending_confirmation_wait_does_not_resume_it() {
+        tauri::async_runtime::block_on(async {
+            let messages = vec![
+                AgentMessage::user_text("delete that file"),
+                AgentMessage::assistant(vec![AgentContent::ToolUse { id: "1".to_string(), name: "delete_file".to_string(), input: serde_json::json!({"path": "x.txt"}) }]),
+                AgentMessage::tool_results(vec![AgentContent::ToolResult { tool_use_id: "1".to_string(), text: "deleted".to_string(), image: None, is_error: false }]),
+            ];
+            let provider = text_only_provider("Done.");
+            let cancel = CancelToken::new();
+            cancel.cancel(); // the token backing the original paused turn is now dead
+            let app = mock_app_handle();
+            let result = run_agent_loop(&provider, messages, &cancel, "test-turn", &WorkingState::default(), &app, |_| {}, |_| {}).await;
+            assert!(result.is_err(), "resuming with an already-cancelled token must refuse, not silently execute");
+        });
+    }
+
+    /// Context/pronoun references: a tool call whose input omits a
+    /// resolvable field (here, `read_file` with no `path`) must fall back to
+    /// `WorkingState.current_file` rather than erroring — the concrete
+    /// "dependent actions using previous results" + "it/that" resolution
+    /// case.
+    #[test]
+    fn a_tool_call_with_an_omitted_field_resolves_it_from_working_state() {
+        tauri::async_runtime::block_on(async {
+            let dir = std::env::temp_dir().join(format!("veronica_test_orch_context_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("notes.txt");
+            std::fs::write(&file, "hello").unwrap();
+
+            let mut context = WorkingState::default();
+            context.note_context(None, None, Some(file.to_str().unwrap().to_string()), None);
+
+            let provider = ScriptedProvider {
+                batches: std::sync::Mutex::new(vec![
+                    vec![
+                        AgentEvent::ToolCallReady { id: "1".to_string(), name: "read_file".to_string(), input: serde_json::json!({}) },
+                        AgentEvent::Done { stop_reason: StopReason::ToolUse },
+                    ],
+                    vec![AgentEvent::TextDelta("It says hello.".to_string()), AgentEvent::Done { stop_reason: StopReason::EndTurn }],
+                ]),
+                calls: AtomicUsize::new(0),
+            };
+            let cancel = CancelToken::new();
+            let app = mock_app_handle();
+            let outcome = run_agent_loop(&provider, vec![AgentMessage::user_text("read that file")], &cancel, "test-turn", &context, &app, |_| {}, |_| {})
+                .await
+                .unwrap();
+            assert!(outcome.actions_taken[0].contains("hello"), "should have resolved the omitted path from WorkingState and read the real file");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

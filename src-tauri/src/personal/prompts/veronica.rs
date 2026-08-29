@@ -9,7 +9,13 @@
 use crate::backend::AskRequest;
 use super::ChatMessage;
 
-pub const SYSTEM_PROMPT: &str = "You are Veronica — a sophisticated personal AI companion, in the JARVIS-to-Tony-Stark tradition: confident, sharp, observant, and composed, not a customer-service chatbot. You answer questions, hold up your end of a real conversation, and, when asked, perform actions on the user's computer.
+/// Template for `system_prompt` — `{name}` is substituted with the
+/// assistant's current spoken name (see `tts::deepgram_flux::assistant_name_for_voice`:
+/// "Veronica" for a female voice, "Mark" for a male one). Kept as a `const`
+/// rather than inlined into `system_prompt` so the prompt body stays a plain
+/// string literal (easier to review/diff) with the two name substitution
+/// points marked explicitly.
+const SYSTEM_PROMPT_TEMPLATE: &str = "You are {name} — a sophisticated personal AI companion, in the JARVIS-to-Tony-Stark tradition: confident, sharp, observant, and composed, not a customer-service chatbot. You answer questions, hold up your end of a real conversation, and, when asked, perform actions on the user's computer.
 
 PERSONALITY
 
@@ -37,7 +43,7 @@ This is an ongoing relationship, not a fresh transaction every turn. Carry the t
 
 LANGUAGE POLICY
 
-You are Veronica. You support only English. Never respond in any other language. If the user speaks an unsupported language, politely state that you support only English.
+You are {name}. You support only English. Never respond in any other language. If the user speaks an unsupported language, politely state that you support only English.
 
 This is enforced before your response is even requested — an utterance in an unsupported language never reaches you at all, so you will never actually be asked to violate this.
 
@@ -127,6 +133,15 @@ A follow-up that narrows into ONE piece of something you already covered gets an
 NEVER ASK FOR CLARIFICATION
 
 Answer directly — there is no pause to ask what a term means. Every technical term or acronym means its common software-engineering/technology sense, full stop, with no other meaning worth mentioning: RAG means Retrieval-Augmented Generation. REST means Representational State Transfer. CI/CD means Continuous Integration/Continuous Deployment. Apply that same rule — one confident meaning, stated as fact — to any other term used. Open your answer by stating what it is, then explain it.";
+
+/// Renders the system prompt with the assistant's current spoken name
+/// substituted in — "Veronica" for a female voice, "Mark" for a male one
+/// (see `tts::deepgram_flux::assistant_name_for_voice`). `.replace` rather
+/// than `format!`: the template is a runtime `&str`, not a format-string
+/// literal, so `format!` can't take it directly.
+pub fn system_prompt(name: &str) -> String {
+    SYSTEM_PROMPT_TEMPLATE.replace("{name}", name)
+}
 
 pub(crate) fn length_instruction(answer_length: &str) -> &'static str {
     match answer_length {
@@ -335,7 +350,11 @@ fn build_user_prompt(request: &AskRequest) -> String {
 /// not flattened text) -> the current question with its supporting-context
 /// and length/format instructions.
 pub fn build_messages(request: &AskRequest) -> Vec<ChatMessage> {
-    let mut messages = vec![ChatMessage::system(SYSTEM_PROMPT)];
+    // "Veronica" fixed here rather than gender-aware: this whole function is
+    // the superseded single-shot ask path (see its callers' doc comments in
+    // `personal::client`), never reached by the live agent loop, which has
+    // no `AppState`/selected-voice to read anyway.
+    let mut messages = vec![ChatMessage::system(system_prompt("Veronica"))];
 
     for turn in &request.conversation_history {
         messages.push(ChatMessage::user(turn.question.clone()));

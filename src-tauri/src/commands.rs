@@ -75,6 +75,81 @@ pub fn set_output_device(state: State<'_, AppState>, device_id: Option<String>) 
     Ok(())
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct TtsVoiceInfo {
+    model: &'static str,
+    label: &'static str,
+}
+
+/// The full Deepgram Flux voice catalog for the Settings -> Audio voice
+/// picker — see `tts::deepgram_flux::VOICES`.
+#[tauri::command]
+pub fn list_tts_voices() -> Vec<TtsVoiceInfo> {
+    crate::tts::deepgram_flux::VOICES
+        .iter()
+        .map(|v| TtsVoiceInfo { model: v.model, label: v.label })
+        .collect()
+}
+
+#[tauri::command]
+pub fn get_selected_voice(state: State<'_, AppState>) -> String {
+    state.selected_voice.get()
+}
+
+/// Sets the Flux voice Veronica speaks with. `voice_model` must be one of
+/// `list_tts_voices`' `model` values. Takes effect the next time a TTS
+/// session opens (mirrors `set_output_device`) — an already-open Flux
+/// session keeps using the voice it connected with.
+#[tauri::command]
+pub fn set_tts_voice(state: State<'_, AppState>, voice_model: String) -> Result<(), String> {
+    if !crate::tts::deepgram_flux::is_known_voice(&voice_model) {
+        return Err(format!("unknown Flux voice model: {voice_model}"));
+    }
+    state.selected_voice.set(voice_model);
+    Ok(())
+}
+
+/// Line spoken by the Settings -> Audio voice picker's per-voice preview
+/// button — short enough to finish quickly, and generic enough that it makes
+/// sense read in any of Flux's 36 voices. Says whichever name that specific
+/// voice would actually self-identify with (`assistant_name_for_voice`:
+/// "Veronica" for a female voice, "Mark" for a male one), so the preview
+/// matches what the assistant would really say once that voice is selected.
+fn voice_preview_text(voice_model: &str) -> String {
+    let name = crate::tts::deepgram_flux::assistant_name_for_voice(voice_model);
+    format!("Hi, I'm {name}. This is how I sound.")
+}
+
+/// Speaks this voice's preview line (see `voice_preview_text`) with
+/// `voice_model`, on a throwaway TTS session (its own audio device handle
+/// and Flux connection, not `AppState.tts` — the app's persistent,
+/// cross-turn session tied to whichever voice is actually selected) so
+/// previewing a voice never disturbs an in-progress real answer or leaves
+/// the persistent session pinned to a voice the user only auditioned but
+/// didn't pick. Runs on a background thread and returns immediately:
+/// playback finishes on its own, there is nothing for the caller to await.
+#[tauri::command]
+pub fn preview_tts_voice(app: tauri::AppHandle, voice_model: String) -> Result<(), String> {
+    if !crate::tts::deepgram_flux::is_known_voice(&voice_model) {
+        return Err(format!("unknown Flux voice model: {voice_model}"));
+    }
+    let preview_text = voice_preview_text(&voice_model);
+    std::thread::Builder::new()
+        .name("tts-voice-preview".into())
+        .spawn(move || {
+            let speaking = crate::tts::TtsSpeakingSignal::default();
+            match crate::tts::TtsSession::start_with_voice(speaking, Some(app), voice_model) {
+                Ok(session) => {
+                    session.begin_turn();
+                    session.speak_now(&preview_text);
+                }
+                Err(err) => log::warn!("Voice preview: failed to start TTS session: {err}"),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// How long a Start request will wait for a previous session's teardown
 /// (`RecordingState::Stopping`) to finish before giving up, when it lands in
 /// that narrow window rather than seeing a clean `Idle`/`Stopped`. Bounded

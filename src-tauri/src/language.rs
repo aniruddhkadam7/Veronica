@@ -56,7 +56,7 @@ impl Decision {
 }
 
 /// The fixed refusal line for a CONFIDENT non-English detection — see
-/// `veronica::prompts::SYSTEM_PROMPT`'s language-policy section for the
+/// `veronica::prompts::system_prompt`'s language-policy section for the
 /// matching instruction told to the model itself (defense in depth, not the
 /// primary enforcement — this function's caller never lets an unsupported
 /// utterance reach the LLM at all, so the model is never actually in a

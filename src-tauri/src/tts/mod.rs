@@ -1,5 +1,6 @@
-//! Text-to-speech: Deepgram Flux (`flux-sienna-en`, over a streaming `wss://`
-//! session) is the only provider. There is no local model and no fallback —
+//! Text-to-speech: Deepgram Flux (over a streaming `wss://` session, voice
+//! model selectable in Settings -> Audio — see `state::SelectedVoice`) is
+//! the only provider. There is no local model and no fallback —
 //! if the Deepgram API key is missing or the session fails (connect
 //! failure, network error), the rest of that answer is simply not spoken
 //! and a warning is logged; the text answer itself is never affected, since
@@ -34,7 +35,7 @@
 //! rather than held here directly.
 
 mod chunker;
-mod deepgram_flux;
+pub mod deepgram_flux;
 mod player;
 
 pub use chunker::SentenceChunker;
@@ -161,6 +162,13 @@ pub struct TtsSession {
     /// its own instrumentation point, unlike the network/synthesis gap this
     /// hook does measure (LLM first token -> TTS first audio).
     on_first_audio_this_turn: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    /// When set, overrides `AppState.selected_voice` for every `speak()`
+    /// call on this session — used only by the Settings -> Audio voice
+    /// preview button (`start_with_voice`), which must speak with the exact
+    /// voice being auditioned regardless of which voice is actually
+    /// selected. `None` for every normal (per-answer) session, which always
+    /// speaks with whatever voice is currently selected.
+    voice_override: Option<String>,
 }
 
 impl TtsSession {
@@ -178,6 +186,18 @@ impl TtsSession {
     /// session — a new `TtsSession` is created per answer, but there is only
     /// ever one mic-mute signal.
     pub fn start(speaking: TtsSpeakingSignal, app: Option<tauri::AppHandle>) -> Result<Self, String> {
+        Self::start_inner(speaking, app, None)
+    }
+
+    /// Like `start`, but every `speak()` call on this session uses
+    /// `voice_model` regardless of the app's actually-selected voice — see
+    /// the `voice_override` field doc. Only used for the Settings -> Audio
+    /// voice preview button (`commands::preview_tts_voice`).
+    pub fn start_with_voice(speaking: TtsSpeakingSignal, app: Option<tauri::AppHandle>, voice_model: String) -> Result<Self, String> {
+        Self::start_inner(speaking, app, Some(voice_model))
+    }
+
+    fn start_inner(speaking: TtsSpeakingSignal, app: Option<tauri::AppHandle>, voice_override: Option<String>) -> Result<Self, String> {
         let device_name = app
             .as_ref()
             .and_then(|app| tauri::Manager::state::<crate::state::AppState>(app).selected_devices.output());
@@ -189,6 +209,7 @@ impl TtsSession {
             speaking,
             app,
             on_first_audio_this_turn: Arc::new(Mutex::new(None)),
+            voice_override,
         })
     }
 
@@ -270,7 +291,13 @@ impl TtsSession {
                 }
                 speaking_for_error.set_session_open(false);
             };
-            match FluxSession::start(on_audio, on_error) {
+            let voice_model = self.voice_override.clone().unwrap_or_else(|| {
+                self.app
+                    .as_ref()
+                    .map(|app| tauri::Manager::state::<crate::state::AppState>(app).selected_voice.get())
+                    .unwrap_or_else(|| deepgram_flux::DEFAULT_VOICE.to_string())
+            });
+            match FluxSession::start(&voice_model, on_audio, on_error) {
                 Ok(session) => {
                     *guard = Some(session);
                 }

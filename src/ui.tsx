@@ -177,6 +177,14 @@ interface SelectProps<T extends string> {
   id?: string;
   disabled?: boolean;
   "aria-label"?: string;
+  /// Replaces an option's default `{opt.label}` row content when provided —
+  /// e.g. the Settings -> Audio voice picker uses this to add a per-voice
+  /// preview button next to the label. Receives the option and must still
+  /// render something that fills the row; the row's own click-to-select and
+  /// keyboard/highlight behavior is unaffected either way; a nested
+  /// interactive element (like a preview button) should stop propagation
+  /// itself if it must not also trigger selection.
+  renderOption?: (opt: SelectOption<T>) => ReactNode;
 }
 
 /// Custom dropdown that replaces bare `<select>` elements app-wide, so every
@@ -194,6 +202,7 @@ export function Select<T extends string>({
   id,
   disabled,
   "aria-label": ariaLabel,
+  renderOption,
 }: SelectProps<T>) {
   const [open, setOpen] = useState(false);
   const [highlighted, setHighlighted] = useState(0);
@@ -296,7 +305,7 @@ export function Select<T extends string>({
               onMouseEnter={() => setHighlighted(i)}
               onClick={() => commit(i)}
             >
-              {opt.label}
+              {renderOption ? renderOption(opt) : opt.label}
             </button>
           ))}
         </div>

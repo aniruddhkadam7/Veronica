@@ -10,6 +10,7 @@ mod analyzer;
 pub mod audio;
 mod backend;
 mod commands;
+mod confirmation;
 mod conversation;
 mod http_client;
 mod interrupt;
@@ -127,13 +128,18 @@ pub fn run() {
             // tier config for its embedding batch size / torch thread count.
             let performance_state = hardware::init(&app.handle().clone());
             let initial_embed_config = {
-                let cfg = performance_state.0.lock().unwrap().effective_config();
+                let cfg = performance_state.manager.lock().unwrap().effective_config();
                 rag::EmbedProcessConfig {
                     embed_batch_size: cfg.rag_embed_batch_size,
                     torch_threads: cfg.rag_torch_threads,
                 }
             };
             app.manage(performance_state);
+
+            // System Agent extension: fires SchedulerOp::ScheduleOnce jobs
+            // once their time arrives — see actions::scheduler's doc for why
+            // this is a dedicated std::thread rather than a tokio task.
+            actions::scheduler::spawn_scheduler_thread(app.handle().clone());
 
             main_window::apply_light_titlebar(&app.handle().clone());
             main_window::position_top_center(&app.handle().clone());
@@ -202,6 +208,10 @@ pub fn run() {
             commands::get_selected_devices,
             commands::set_input_device,
             commands::set_output_device,
+            commands::list_tts_voices,
+            commands::get_selected_voice,
+            commands::set_tts_voice,
+            commands::preview_tts_voice,
             commands::start_system_audio_capture,
             commands::pause_recording,
             commands::resume_recording,
@@ -236,6 +246,7 @@ pub fn run() {
             veronica::try_interrupt,
             veronica::get_conversation_history,
             veronica::reset_conversation,
+            veronica::respond_to_confirmation,
             veronica_widget::show_veronica_widget,
             veronica_widget::hide_veronica_widget,
             veronica_widget::resize_veronica_widget,
@@ -252,6 +263,8 @@ pub fn run() {
             hardware::commands::get_hardware_profile,
             hardware::commands::get_performance_mode,
             hardware::commands::set_performance_mode,
+            hardware::commands::get_turn_telemetry_history,
+            hardware::commands::clear_turn_telemetry,
             main_window::set_popover_content_height,
             personal::commands::personal_get_api_key,
             personal::commands::personal_set_api_key,

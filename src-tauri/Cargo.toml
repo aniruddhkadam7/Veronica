@@ -57,6 +57,12 @@ windows = { version = "0.61", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_Graphics_Gdi",
+    # System Agent extension (src/actions/storage.rs, processes.rs,
+    # network.rs): recycle-bin-safe delete via the Shell, and process/network
+    # queries.
+    "Win32_UI_Shell_Common",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
 ] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
@@ -103,4 +109,15 @@ cpal = "0.15"
 # process-wide (see src/tls_init.rs) instead of pulling in native-tls/OpenSSL.
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 http = "1.5.0"
+# System Agent extension (src/actions/watchers.rs): filesystem watching for
+# Capability::WatcherOp — a native OS filesystem-notification API
+# (ReadDirectoryChangesW on Windows), not a polling loop.
+notify = "6"
+
+[dev-dependencies]
+# Enables `tauri::test::mock_app()` — used by execute_tool's own tests
+# (src/actions/mod.rs) to exercise the real dispatch path end-to-end
+# (including SchedulerOp/WatcherOp, which need a real AppHandle) without a
+# full running app.
+tauri = { version = "2", features = ["test"] }
 

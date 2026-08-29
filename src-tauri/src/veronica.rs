@@ -34,12 +34,29 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::actions::{self, Capability, TaskControlOp, ToolOutcome};
+use crate::actions::{self, Capability, RiskLevel, TaskControlOp, ToolOutcome};
+use crate::confirmation;
 use crate::hardware::telemetry::{PipelineStage, TurnTelemetry};
 use crate::personal::agent::{run_agent_loop, AgentContent, AgentMessage};
 use crate::personal::prompts::veronica as prompts;
 use crate::state::AppState;
 use crate::tts::{SentenceChunker, TtsSession};
+
+/// A `Sensitive`/`Destructive` capability withheld pending the user's
+/// yes/no — see `AppState.pending_confirmation`. `tool_use_id`/`tool_name`/
+/// `messages` are only populated when the pause came from the agent loop
+/// (see `personal::agent::orchestrator::PendingToolConfirmation`); a
+/// fast-router-originated confirmation leaves them empty/default since
+/// there's no agent-loop message history to resume.
+#[derive(Debug, Clone)]
+pub struct PendingConfirmation {
+    pub turn_id: String,
+    pub capability: Capability,
+    pub risk: RiskLevel,
+    pub messages: Vec<AgentMessage>,
+    pub tool_use_id: String,
+    pub tool_name: String,
+}
 
 /// Answer-shaping options chosen in the overlay's settings panel. Everything
 /// is optional: `Default` reproduces the plain "natural, default length"
@@ -63,6 +80,16 @@ pub struct AskOptions {
     /// must be a no-op end to end when the user hasn't opted in.
     #[serde(default)]
     pub tts_enabled: bool,
+    /// Why the frontend decided to finalize and send this turn — one of
+    /// "classifier_complete" (turnHeuristics.ts's classifyTurnAction
+    /// returned "send" immediately), "safety_net_elapsed" (the bounded
+    /// fallback timer fired after the text looked incomplete), or
+    /// "manual_submit" (an explicit Enter/Ask-button click via `askNow`,
+    /// bypassing the classifier). `None` for a caller that doesn't report
+    /// one (e.g. an older/other client). Debugging only (requirement 10) —
+    /// never used for a routing/behavior decision.
+    #[serde(default)]
+    pub finalize_reason: Option<String>,
 }
 
 fn default_answer_length() -> String {
@@ -85,6 +112,7 @@ impl Default for AskOptions {
             humanization: default_humanization(),
             llm_provider: None,
             tts_enabled: false,
+            finalize_reason: None,
         }
     }
 }
@@ -168,6 +196,41 @@ struct LanguageDetectedPayload {
     language: String,
 }
 
+/// Emitted once per pending confirmation — see `PendingConfirmation` and
+/// `respond_to_confirmation`. `risk` is `"sensitive"` or `"destructive"` so
+/// the overlay's dialog can style the two differently.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfirmationRequestedPayload {
+    turn_id: String,
+    summary: String,
+    detail: String,
+    risk: String,
+}
+
+fn risk_wire_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Safe => "safe", // never actually emitted — NeedsConfirmation only ever carries Sensitive/Destructive
+        RiskLevel::Sensitive => "sensitive",
+        RiskLevel::Destructive => "destructive",
+    }
+}
+
+/// Short label for the confirmation dialog's title — derived from the
+/// capability's shape, never its raw `Debug` string (that's reserved for
+/// logs/`WorkingState.recent_actions`, not user-facing text).
+fn confirmation_summary(capability: &Capability) -> String {
+    match capability {
+        Capability::StorageOp(actions::StorageOp::DeleteFile { .. }) => "Delete file?".to_string(),
+        Capability::StorageOp(actions::StorageOp::MoveOrRename { .. }) => "Move file?".to_string(),
+        Capability::ProcessOp(actions::ProcessOp::Kill { .. }) => "End process?".to_string(),
+        Capability::TerminalOp(actions::TerminalOp::RunCommand { .. }) => "Run command?".to_string(),
+        Capability::SchedulerOp(_) => "Schedule action?".to_string(),
+        Capability::WatcherOp(_) => "Watch for changes?".to_string(),
+        _ => "Confirm action?".to_string(),
+    }
+}
+
 /// How many prior turns to forward. The overlay keeps the whole conversation
 /// on screen, but only the recent tail is worth paying for in the prompt:
 /// every turn adds tokens to time-to-first-token, which is the number the
@@ -190,14 +253,20 @@ fn trim_history(turns: Vec<(String, String)>) -> Vec<PriorTurn> {
 }
 
 /// Builds the agent loop's system message: the persona/voice/format prompt
-/// (`prompts::SYSTEM_PROMPT`, its former ACTION-TAKING section replaced by
-/// real tool-calling instructions — see that constant, which now also
+/// (`prompts::system_prompt`, its former ACTION-TAKING section replaced by
+/// real tool-calling instructions — see that function, which now also
 /// carries the fixed English-only language-policy instruction), plus this
 /// specific question's length/format target (reusing the exact same
 /// classifiers the old single-shot path used), and, when there's anything
 /// worth mentioning, the working-state context block so "it"/"this"/"the
 /// previous one" resolve.
-fn build_system_message(question: &str, options: &AskOptions, working_context: Option<String>) -> AgentMessage {
+///
+/// `assistant_name` is "Veronica" or "Mark" depending on the currently
+/// selected Flux voice's gender (see
+/// `tts::deepgram_flux::assistant_name_for_voice`) — the assistant
+/// self-identifies with whichever name matches the voice the user actually
+/// hears, rather than always saying "Veronica" regardless of voice.
+fn build_system_message(question: &str, options: &AskOptions, working_context: Option<String>, assistant_name: &str) -> AgentMessage {
     let format_line = match prompts::classify_format(question) {
         Some(hint) => format!("{hint}\n\n"),
         None => "Pick the matching FORMAT from the system prompt above.\n\n".to_string(),
@@ -206,7 +275,7 @@ fn build_system_message(question: &str, options: &AskOptions, working_context: O
 
     let mut text = format!(
         "{}\n\n---\n\n{format_line}TARGET LENGTH FOR THIS SPECIFIC QUESTION (the binding instruction — follow this number, not a habit of always answering the same length): {length_hint}\n(User's overall ceiling, only relevant if it would push you shorter than the target above: {})\n\n{} {}",
-        prompts::SYSTEM_PROMPT,
+        prompts::system_prompt(assistant_name),
         prompts::length_instruction(&options.answer_length),
         prompts::style_instruction(&options.response_style),
         prompts::humanization_instruction(&options.humanization),
@@ -354,6 +423,158 @@ fn dispatch_task_control(state: &AppState, op: TaskControlOp) -> String {
     }
 }
 
+/// Stashes a withheld capability into `state.pending_confirmation`, speaks/
+/// streams `voice_prompt` as this turn's answer, and emits
+/// `veronica:confirmation-requested` for the overlay's dialog — the shared
+/// "pause and ask" step both the fast-router arm and the agent-loop arm of
+/// `run_turn` use when `execute_tool`/`run_agent_loop` reports a capability
+/// needs confirmation. Returns the spoken/shown text so the caller can
+/// return it as this turn's `Ok(answer)`.
+#[allow(clippy::too_many_arguments)]
+fn request_confirmation(
+    app: &AppHandle,
+    state: &AppState,
+    turn_id: &str,
+    capability: Capability,
+    risk: RiskLevel,
+    voice_prompt: String,
+    messages: Vec<AgentMessage>,
+    tool_use_id: String,
+    tool_name: String,
+    tts_session: Option<&TtsSession>,
+) -> String {
+    *state.pending_confirmation.lock().unwrap() = Some(PendingConfirmation {
+        turn_id: turn_id.to_string(),
+        capability: capability.clone(),
+        risk,
+        messages,
+        tool_use_id,
+        tool_name,
+    });
+    let _ = app.emit(
+        "veronica:confirmation-requested",
+        ConfirmationRequestedPayload {
+            turn_id: turn_id.to_string(),
+            summary: confirmation_summary(&capability),
+            detail: voice_prompt.clone(),
+            risk: risk_wire_label(risk).to_string(),
+        },
+    );
+    if let Some(session) = tts_session {
+        session.speak_now(&voice_prompt);
+    }
+    let _ = app.emit("veronica:answer-delta", AnswerDeltaPayload { turn_id: turn_id.to_string(), delta: voice_prompt.clone() });
+    voice_prompt
+}
+
+/// Resolves a pending confirmation once the user has answered yes/no —
+/// shared by `run_turn`'s next-turn check (voice reply, via
+/// `confirmation::classify_reply`) and `respond_to_confirmation` (the
+/// overlay dialog's button click, which already knows `approved`
+/// unambiguously and skips text classification entirely).
+async fn resolve_pending_confirmation(app: &AppHandle, state: &AppState, pending: PendingConfirmation, approved: bool, tts_session: Option<&TtsSession>) -> String {
+    if !approved {
+        let mut working = state.working_state.lock().unwrap();
+        if working.current_task.is_some() {
+            working.complete_task();
+        }
+        drop(working);
+        let text = "Okay, I won't do that.".to_string();
+        if let Some(session) = tts_session {
+            session.speak_now(&text);
+        }
+        let _ = app.emit("veronica:answer-delta", AnswerDeltaPayload { turn_id: pending.turn_id.clone(), delta: text.clone() });
+        return text;
+    }
+
+    let outcome = actions::verification::execute_and_verify(&pending.capability, true, app).await;
+    let result_text = match &outcome {
+        Ok(ToolOutcome::Text(text)) => text.clone(),
+        Ok(ToolOutcome::Image { .. }) => "Done.".to_string(),
+        Ok(ToolOutcome::NeedsConfirmation { .. }) => unreachable!("execute_and_verify(confirmed: true) never re-withholds"),
+        Err(err) => err.clone(),
+    };
+
+    let update = actions::context::derive_context_updates(&pending.capability);
+    {
+        let mut working = state.working_state.lock().unwrap();
+        working.record_action(format!("{:?}", pending.capability), result_text.clone());
+        working.note_context(update.app, update.window, update.file, update.folder);
+    }
+
+    // If this confirmation paused the agent loop (rather than the fast
+    // router), resume it with the now-confirmed result appended — the whole
+    // resume mechanism is just feeding the paused loop one more message, no
+    // separate resume API. If it came from the fast router, the result IS
+    // the answer.
+    if !pending.tool_use_id.is_empty() {
+        let is_error = outcome.is_err();
+        let mut messages = pending.messages;
+        messages.push(AgentMessage::tool_results(vec![AgentContent::ToolResult {
+            tool_use_id: pending.tool_use_id,
+            text: result_text.clone(),
+            image: None,
+            is_error,
+        }]));
+
+        let Ok(client) = crate::personal::DirectLlmClient::new(None) else {
+            return result_text;
+        };
+        let provider = client.agentic_provider();
+        let cancel = state.begin_turn();
+        let working_snapshot = state.working_state.lock().unwrap().clone();
+        let app_for_delta = app.clone();
+        let turn_id_for_delta = pending.turn_id.clone();
+        let on_text_delta = |delta: &str| {
+            let _ = app_for_delta.emit("veronica:answer-delta", AnswerDeltaPayload { turn_id: turn_id_for_delta.clone(), delta: delta.to_string() });
+        };
+        match run_agent_loop(provider.as_ref(), messages, &cancel, &pending.turn_id, &working_snapshot, app, on_text_delta, |_| {}).await {
+            Ok(resumed) if resumed.pending_confirmation.is_none() => {
+                if let Some(session) = tts_session {
+                    session.speak_now(&resumed.final_text);
+                }
+                resumed.final_text
+            }
+            Ok(resumed) => {
+                // The resumed loop immediately hit ANOTHER confirmation —
+                // chain into a new pending-confirmation prompt rather than
+                // losing it.
+                if let Some(next) = resumed.pending_confirmation {
+                    request_confirmation(app, state, &pending.turn_id, next.capability, next.risk, next.voice_prompt, resumed.messages, next.tool_use_id, next.tool_name, tts_session)
+                } else {
+                    result_text
+                }
+            }
+            Err(_) => result_text,
+        }
+    } else {
+        if let Some(session) = tts_session {
+            session.speak_now(&result_text);
+        }
+        let _ = app.emit("veronica:answer-delta", AnswerDeltaPayload { turn_id: pending.turn_id.clone(), delta: result_text.clone() });
+        result_text
+    }
+}
+
+/// The overlay's confirmation dialog button click — unambiguous, so it skips
+/// `confirmation::classify_reply` entirely and resolves directly. Emits the
+/// same terminal events as `ask_veronica` on the SAME `turn_id` so it slots
+/// into the existing overlay `Turn` object rather than creating a new one.
+#[tauri::command]
+pub async fn respond_to_confirmation(app: AppHandle, state: State<'_, AppState>, turn_id: String, approved: bool) -> Result<String, String> {
+    let pending = state.pending_confirmation.lock().unwrap().take();
+    let Some(pending) = pending else {
+        return Err("that confirmation has expired".to_string());
+    };
+    if pending.turn_id != turn_id {
+        return Err("that confirmation has expired".to_string());
+    }
+    let tts_session = ensure_tts_session(&app, &state, true);
+    let answer = resolve_pending_confirmation(&app, &state, pending, approved, tts_session.as_ref()).await;
+    let _ = app.emit("veronica:answer-complete", AnswerCompletePayload { turn_id: turn_id.clone(), answer: answer.clone(), cancelled: false });
+    Ok(answer)
+}
+
 /// One question, one turn — either the fast router's deterministic match
 /// (no LLM call) or the agent loop (streamed, tool-calling). Streams back
 /// as `veronica:answer-delta` events.
@@ -385,6 +606,17 @@ pub async fn ask_veronica(
     if trimmed.is_empty() {
         return Err("no question text to send".into());
     }
+    // Backend defense-in-depth (requirement 9): two frontend windows (the
+    // widget and the overlay) both listen to the same `transcript:update`
+    // emit and, even with the shared `useAutoAsk` turn-boundary hook,
+    // remain two independent hook instances — this is the one place that
+    // can see across them. Rejected outright, before any turn is created,
+    // rather than superseded like `AppState::begin_turn` does for a
+    // genuinely newer turn (see `try_claim_ask`'s doc for the distinction).
+    if !state.try_claim_ask(trimmed, std::time::Duration::from_millis(2500)) {
+        log::info!("[DUPLICATE_SUPPRESSED] turn_id={turn_id} text={trimmed:?}");
+        return Err("duplicate question already in flight".to_string());
+    }
     let options = options.unwrap_or_default();
     // Derived from the ONE shared conversation store (see conversation.rs),
     // NOT a caller-supplied parameter — a follow-up asked through either
@@ -402,6 +634,7 @@ pub async fn ask_veronica(
     // the conversation/UI-facing turn identity.
     log::info!("[TURN_CREATED] turn_id={turn_id}");
     log::info!("[USER_MESSAGE] turn_id={turn_id} text={trimmed:?}");
+    log::info!("[FINALIZE_REASON] turn_id={turn_id} reason={}", options.finalize_reason.as_deref().unwrap_or("unspecified"));
 
     // Recorded into the ONE shared conversation store immediately — before
     // any router/LLM work starts — so this turn is visible to whichever
@@ -451,7 +684,9 @@ pub async fn ask_veronica(
     };
 
     telemetry.mark(PipelineStage::TurnComplete);
-    telemetry.finish(&crate::hardware::perf_context(&app));
+    let perf_ctx = crate::hardware::perf_context(&app);
+    crate::hardware::record_turn_telemetry(&app, telemetry.snapshot(&perf_ctx));
+    telemetry.finish(&perf_ctx);
 
     let final_result = match result {
         Ok(answer) => {
@@ -508,6 +743,33 @@ async fn run_turn(
     telemetry: &Arc<TurnTelemetry>,
     cancel: &crate::state::CancelToken,
 ) -> Result<String, String> {
+    // A pending confirmation always takes priority over normal dispatch —
+    // classify this utterance as a yes/no reply to it first. `None` means
+    // the user said something unrelated (asked a fresh question instead of
+    // answering); silently drop the stale pending confirmation and fall
+    // through to normal processing rather than getting stuck waiting for a
+    // yes/no that was never coming.
+    let taken_pending = state.pending_confirmation.lock().unwrap().take();
+    if let Some(pending) = taken_pending {
+        match confirmation::classify_reply(trimmed) {
+            Some(approved) => {
+                log::info!(
+                    "[CONFIRMATION_PENDING_STATE] turn_id={turn_id} had_pending=true classified={}",
+                    if approved { "yes" } else { "no" }
+                );
+                return Ok(resolve_pending_confirmation(app, state, pending, approved, tts_session).await);
+            }
+            None => {
+                log::info!(
+                    "[CONFIRMATION_PENDING_STATE] turn_id={turn_id} had_pending=true classified=unrelated"
+                );
+                log::info!("[CONFIRMATION] turn_id={turn_id} dropping stale pending confirmation from turn_id={} — new utterance is unrelated", pending.turn_id);
+            }
+        }
+    } else {
+        log::info!("[CONFIRMATION_PENDING_STATE] turn_id={turn_id} had_pending=false");
+    }
+
     // Language/quality gate: runs on the raw transcript, before the fast
     // router AND before any LLM call — see `crate::language`'s doc for why
     // enforcement lives here rather than at the STT-provider level (Groq's
@@ -570,14 +832,26 @@ async fn run_turn(
         }
         Some(capability) => {
             let _ = app.emit("veronica:action-start", ActionPayload { turn_id: turn_id.to_string(), action: format!("{capability:?}") });
-            let outcome = actions::execute_tool(&capability).await;
+            let outcome = actions::verification::execute_and_verify(&capability, false, app).await;
             let _ = app.emit("veronica:action-complete", TurnIdPayload { turn_id: turn_id.to_string() });
+
+            if let Ok(ToolOutcome::NeedsConfirmation { capability, risk, voice_prompt }) = outcome {
+                let answer = request_confirmation(app, state, turn_id, capability, risk, voice_prompt, Vec::new(), String::new(), String::new(), tts_session);
+                return Ok(answer);
+            }
+
             let result = match outcome {
                 Ok(ToolOutcome::Text(text)) => text,
                 Ok(ToolOutcome::Image { .. }) => "Done.".to_string(), // CaptureScreen never fast-routes — see capability.rs
+                Ok(ToolOutcome::NeedsConfirmation { .. }) => unreachable!("handled above"),
                 Err(err) => err,
             };
-            state.working_state.lock().unwrap().record_action(format!("{capability:?}"), result.clone());
+            let update = actions::context::derive_context_updates(&capability);
+            {
+                let mut working = state.working_state.lock().unwrap();
+                working.record_action(format!("{capability:?}"), result.clone());
+                working.note_context(update.app, update.window, update.file, update.folder);
+            }
             if let Some(session) = tts_session {
                 arm_tts_telemetry(session, telemetry);
                 telemetry.mark(PipelineStage::TtsStarted);
@@ -601,8 +875,10 @@ async fn run_turn(
             let client = crate::personal::DirectLlmClient::new(options.llm_provider.as_deref())?;
             let provider = client.agentic_provider();
 
-            let working_context = state.working_state.lock().unwrap().render_context_block();
-            let mut messages = vec![build_system_message(trimmed, options, working_context)];
+            let working_snapshot = state.working_state.lock().unwrap().clone();
+            let working_context = working_snapshot.render_context_block();
+            let assistant_name = crate::tts::deepgram_flux::assistant_name_for_voice(&state.selected_voice.get());
+            let mut messages = vec![build_system_message(trimmed, options, working_context, assistant_name)];
             for turn in history {
                 messages.push(AgentMessage::user_text(turn.question.clone()));
                 messages.push(AgentMessage::assistant_text(turn.answer.clone()));
@@ -666,7 +942,7 @@ async fn run_turn(
             // `?` here too: a cancelled or genuinely failed agent loop
             // becomes this function's `Err`, handled uniformly by the
             // caller — no special-casing needed at this call site anymore.
-            let agent_outcome = run_agent_loop(provider.as_ref(), messages, cancel, turn_id, on_text_delta, on_progress).await?;
+            let agent_outcome = run_agent_loop(provider.as_ref(), messages, cancel, turn_id, &working_snapshot, app, on_text_delta, on_progress).await?;
             telemetry.mark(PipelineStage::LlmComplete);
             log::info!("[LLM_COMPLETE] turn_id={turn_id} chars={}", agent_outcome.final_text.len());
 
@@ -676,6 +952,31 @@ async fn run_turn(
                     working.record_action(action_summary.clone(), agent_outcome.final_text.clone());
                 }
             }
+
+            if let Some(pending) = agent_outcome.pending_confirmation {
+                // The loop paused instead of finishing — speak/show the
+                // confirmation prompt as this turn's answer and stash the
+                // resume state, rather than the (empty/partial) final_text.
+                if let Some(session) = tts_session {
+                    if let Some(trailing) = chunker.lock().unwrap().finish() {
+                        session.speak(&trailing);
+                    }
+                }
+                let answer = request_confirmation(
+                    app,
+                    state,
+                    turn_id,
+                    pending.capability,
+                    pending.risk,
+                    pending.voice_prompt,
+                    agent_outcome.messages,
+                    pending.tool_use_id,
+                    pending.tool_name,
+                    tts_session,
+                );
+                return Ok(answer);
+            }
+
             if let Some(session) = tts_session {
                 if let Some(trailing) = chunker.lock().unwrap().finish() {
                     session.speak(&trailing);
@@ -768,7 +1069,7 @@ mod tests {
     #[test]
     fn build_system_message_includes_working_context_when_present() {
         let options = AskOptions::default();
-        let message = build_system_message("open vs code", &options, Some("Current task: testing".to_string()));
+        let message = build_system_message("open vs code", &options, Some("Current task: testing".to_string()), "Veronica");
         let AgentContent::Text(text) = &message.content[0] else { panic!("expected text content") };
         assert!(text.contains("Current task: testing"));
     }
@@ -776,7 +1077,7 @@ mod tests {
     #[test]
     fn build_system_message_omits_the_context_block_when_none() {
         let options = AskOptions::default();
-        let message = build_system_message("what is rust", &options, None);
+        let message = build_system_message("what is rust", &options, None, "Veronica");
         let AgentContent::Text(text) = &message.content[0] else { panic!("expected text content") };
         assert!(!text.contains("CURRENT SESSION STATE"));
     }

@@ -1,4 +1,4 @@
-//! Deepgram Flux TTS (`flux-sienna-en`) client: a persistent `wss://`
+//! Deepgram Flux TTS client: a persistent `wss://`
 //! session for one answer's worth of speech, not one request per sentence.
 //!
 //! This is the only TTS provider in the app — there is no local model, no
@@ -45,11 +45,93 @@ use tungstenite::Message;
 
 const SPEAK_URL: &str = "wss://api.deepgram.com/v2/speak";
 
-/// Flux's "Sienna" voice, picked in Settings -> Voice Controls. Fixed, not
-/// user-configurable: the user picked this specific voice, and switching it
-/// is a deliberate code change, not a runtime setting (unlike the API key,
-/// which is a secret entered in Settings and must never live in source).
-const MODEL: &str = "flux-sienna-en";
+/// Default Flux voice, used until the user picks a different one in
+/// Settings -> Audio (see `state::SelectedVoice`). Sienna was the original
+/// hand-picked default before voice selection became a runtime setting.
+pub const DEFAULT_VOICE: &str = "flux-sienna-en";
+
+/// A voice's grammatical gender, as Deepgram's own catalog labels it — used
+/// only to pick the assistant's spoken/self-identifying name (see
+/// `assistant_name_for_voice`): "Veronica" for a female voice, "Mark" for a
+/// male voice. Not used for anything else (no gendered phrasing elsewhere in
+/// the app).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VoiceGender {
+    Female,
+    Male,
+}
+
+/// One selectable Flux voice, as shown in the Settings -> Audio voice
+/// picker. `model` is the exact string Flux's `model` query parameter
+/// expects (format `flux-{name}-{lang}`).
+pub struct FluxVoice {
+    pub model: &'static str,
+    pub label: &'static str,
+    pub gender: VoiceGender,
+}
+
+/// The full Flux voice catalog (developers.deepgram.com/docs/flux-tts/voices,
+/// English voices only — this app has no language selection). Kept as a
+/// fixed list rather than fetched at runtime: Deepgram has no public
+/// "list voices" API endpoint, and a hardcoded list is trivial to update
+/// alongside Deepgram's own release notes when they add voices.
+pub const VOICES: &[FluxVoice] = &[
+    FluxVoice { model: "flux-hannah-en", label: "Hannah (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-kit-en", label: "Kit (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-alexis-en", label: "Alexis (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-cliff-en", label: "Cliff (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-sienna-en", label: "Sienna (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-cole-en", label: "Cole (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-brooke-en", label: "Brooke (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-colin-en", label: "Colin (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-gemma-en", label: "Gemma (British, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-haley-en", label: "Haley (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-heather-en", label: "Heather (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-miles-en", label: "Miles (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-sean-en", label: "Sean (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-bree-en", label: "Bree (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-brittany-en", label: "Brittany (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-bruce-en", label: "Bruce (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-conor-en", label: "Conor (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-donovan-en", label: "Donovan (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-drew-en", label: "Drew (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-elise-en", label: "Elise (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-jack-en", label: "Jack (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-kai-en", label: "Kai (Singaporean, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-kelsey-en", label: "Kelsey (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-maeve-en", label: "Maeve (Irish, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-marcelo-en", label: "Marcelo (Filipino, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-marcus-en", label: "Marcus (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-meena-en", label: "Meena (Indian, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-meghan-en", label: "Meghan (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-naveen-en", label: "Naveen (Indian, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-paige-en", label: "Paige (American, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-priya-en", label: "Priya (Indian, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-rufus-en", label: "Rufus (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-sharon-en", label: "Sharon (Australian, Female)", gender: VoiceGender::Female },
+    FluxVoice { model: "flux-tanner-en", label: "Tanner (British, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-wade-en", label: "Wade (American, Male)", gender: VoiceGender::Male },
+    FluxVoice { model: "flux-wes-en", label: "Wes (American, Male)", gender: VoiceGender::Male },
+];
+
+/// Whether `model` is a recognized Flux voice — used to reject an unknown
+/// value from `set_tts_voice` rather than silently sending garbage to Flux's
+/// `model` query parameter on the next session.
+pub fn is_known_voice(model: &str) -> bool {
+    VOICES.iter().any(|v| v.model == model)
+}
+
+/// The assistant's spoken/self-identifying name for `voice_model` —
+/// "Veronica" for every female voice, "Mark" for every male voice. Falls
+/// back to "Veronica" for an unrecognized model string (never panics; mirrors
+/// `DEFAULT_VOICE`'s own female default), so a bad/stale value never breaks
+/// the system prompt or preview line, only mis-genders one line of text.
+pub fn assistant_name_for_voice(voice_model: &str) -> &'static str {
+    match VOICES.iter().find(|v| v.model == voice_model).map(|v| v.gender) {
+        Some(VoiceGender::Male) => "Mark",
+        Some(VoiceGender::Female) | None => "Veronica",
+    }
+}
 
 /// Sample rate requested from Flux for linear16 output. Fixed alongside
 /// `MODEL` — the player (`tts::player`) is built assuming this exact rate,
@@ -175,10 +257,12 @@ impl FluxSession {
     /// `connect_with_retry`/the read loop below) so a failure is always
     /// diagnosable from logs, never silent.
     pub fn start(
+        voice_model: &str,
         mut on_audio: impl FnMut(&[u8]) + Send + 'static,
         mut on_error: impl FnMut(FluxError) + Send + 'static,
     ) -> Result<Self, FluxError> {
         let key = api_key()?;
+        let voice_model = voice_model.to_string();
         let (tx, rx) = mpsc::channel::<FluxCommand>();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_for_thread = alive.clone();
@@ -193,7 +277,7 @@ impl FluxSession {
                 // case without repeating the store at each `return`/`break`.
                 let _alive_guard = ClearOnDrop(&alive_for_thread);
 
-                let mut socket = match connect_with_retry(&key) {
+                let mut socket = match connect_with_retry(&key, &voice_model) {
                     Ok(socket) => socket,
                     Err(err) => {
                         on_error(FluxError::ConnectFailed(err));
@@ -375,8 +459,8 @@ impl FluxSession {
 /// connection URL is logged with the query string only (model/encoding/
 /// sample_rate) — never the `Authorization` header, which is a separate
 /// field never interpolated into any log line.
-fn connect_with_retry(key: &str) -> Result<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, String> {
-    let url = format!("{SPEAK_URL}?model={MODEL}&encoding=linear16&sample_rate={SAMPLE_RATE}&expressivity={EXPRESSIVITY}");
+fn connect_with_retry(key: &str, voice_model: &str) -> Result<tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, String> {
+    let url = format!("{SPEAK_URL}?model={voice_model}&encoding=linear16&sample_rate={SAMPLE_RATE}&expressivity={EXPRESSIVITY}");
     let mut last_err = String::new();
 
     for attempt in 1..=MAX_CONNECT_ATTEMPTS {
@@ -502,7 +586,7 @@ mod tests {
     #[test]
     #[ignore = "depends on real Windows Credential Manager state (no stored 'deepgram' key) — not controllable from a unit test"]
     fn missing_key_is_reported_without_connecting() {
-        let result = FluxSession::start(|_| {}, |_| {});
+        let result = FluxSession::start(DEFAULT_VOICE, |_| {}, |_| {});
         assert!(matches!(result, Err(FluxError::MissingKey)));
     }
 }

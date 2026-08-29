@@ -50,6 +50,71 @@ fn barge_in_rms_threshold() -> f32 {
 /// short-term energy than someone deliberately interrupting to talk.
 const BARGE_IN_SUSTAIN: Duration = Duration::from_millis(180);
 
+/// How long to keep the mic muted after `TtsSpeakingSignal` reports Veronica
+/// has genuinely stopped (both the Flux session closed AND the player's sink
+/// finished draining — see `TtsSpeakingSignal`'s doc), before trusting mic
+/// input as real user speech again.
+///
+/// Exists because un-muting exactly on that instant was measured to still
+/// pick up Veronica's own trailing audio — acoustic/electronic tail from a
+/// Bluetooth output device — as a short phrase (typically the last word or
+/// two of her own answer, e.g. "...thank you for asking, sir" tailing off
+/// into what Whisper transcribes as a bare "Thank you.") and answer it as a
+/// new real question, which can then itself produce a short reply that
+/// echoes again — a live-observed, confirmed-in-logs runaway loop, not a
+/// hypothetical. `is_speaking()` alone (the mute condition below) cannot see
+/// this: it goes false the instant playback is DONE, not once the room has
+/// actually gone quiet.
+///
+/// Kept deliberately short — real-word latency (how soon after Veronica
+/// finishes can the user's own next utterance start being heard) matters
+/// more here than defense-in-depth, since a too-long value would itself
+/// clip the start of a fast follow-up. 150ms was picked as a starting point
+/// per live testing (not a guess left untuned): short enough to be
+/// imperceptible as a delay before listening resumes, long enough in
+/// practice to clear the trailing echo that produced the repeated "Thank
+/// you." loop. Tunable via `VERONICA_TTS_SETTLE_MS` without a rebuild if a
+/// particular output device needs more (or less) margin.
+fn tts_settle_duration() -> Duration {
+    std::env::var("VERONICA_TTS_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(150))
+}
+
+/// Root-cause fix for a false/stale-transcript bug distinct from the
+/// TTS-tail settle window above: when muting the mic for TTS (below), the
+/// code used to call `sidecar.flush()` unconditionally "so a half-decoded
+/// utterance doesn't sit in the decoder." But the local engine has no real
+/// speech/non-speech judgment by default (its VAD pre-gate is a pass-
+/// through — see `stt::sidecar::SttSidecar::flush`'s doc) — ANY audio at
+/// all (room tone, a keyboard click, mic self-noise) can leave it with an
+/// in-progress "utterance" the instant Veronica starts talking, with
+/// nothing to do with what the user actually said. An unconditional flush
+/// force-finalized that fragment and shipped it to Groq, which could
+/// hallucinate a short, plausible phrase (e.g. "Thank you.") from audio the
+/// user never spoke — a false user turn Veronica would then reply to.
+///
+/// The fix: only flush if at least this much audio is already buffered
+/// (see `SttSidecar::pending_audio_duration`). A stray chunk or two of
+/// ambient noise (well under 200ms) never reaches this — flush becomes a
+/// no-op for it, and the fragment simply stays buffered, gated off from
+/// Groq the same way any other muted-for-TTS audio is, until either it
+/// grows into something substantial or gets cleared by the NEXT real
+/// flush/finalization. A genuine short utterance the user was mid-saying
+/// when Veronica started talking (e.g. one word, ~300ms+) still clears this
+/// bar and gets finalized/transcribed promptly, so legitimate speech isn't
+/// silently dropped — this is a minimum-plausible-utterance floor, not a
+/// delay: it adds no wait time to anything that already exceeds it.
+fn min_flush_worthy_audio() -> Duration {
+    std::env::var("VERONICA_MIN_FLUSH_AUDIO_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(350))
+}
+
 #[derive(Default)]
 struct MicSessionHandles {
     stop_signal: Option<StopSignal>,
@@ -194,6 +259,7 @@ pub fn start_mic_assistant(
     let app_for_level = app.clone();
     let app_for_barge_in = app.clone();
     let barge_in_rms = barge_in_rms_threshold();
+    let settle_duration = tts_settle_duration();
     std::thread::Builder::new()
         .name("mic-assistant-pump".into())
         .spawn(move || {
@@ -218,6 +284,13 @@ pub fn start_mic_assistant(
             // so re-enabling it flushes the decoder exactly once, same as
             // `was_muted` does for the TTS-speaking case below.
             let mut was_user_muted = false;
+            // Set the instant `is_speaking` is first observed false after
+            // being true — see `tts_settle_duration`'s doc for why the mic
+            // stays muted a little past that instant rather than un-muting
+            // on it directly. `None` means either TTS has never spoken yet
+            // this session, or the settle window already elapsed and normal
+            // listening has resumed.
+            let mut settling_since: Option<Instant> = None;
             for chunk in audio_rx.iter() {
                 // Emitted unconditionally (even while muted for TTS) so the
                 // orb widgets' "listening" animation reflects real mic input
@@ -244,25 +317,52 @@ pub fn start_mic_assistant(
                         }
                         was_user_muted = true;
                         loud_since = None;
+                        log::info!("[TTS_MUTE_STATE] source=mic muted=true reason=user_muted");
                     }
                     continue;
                 }
                 if was_user_muted {
                     was_user_muted = false;
+                    log::info!("[TTS_MUTE_STATE] source=mic muted=false reason=user_unmuted");
                 }
 
                 let is_speaking = tts_speaking.is_speaking();
                 if is_speaking {
+                    // Actively speaking again (e.g. a fast follow-up answer
+                    // right after a brief pause) — cancel any settle window
+                    // from a previous stop rather than let a stale timer
+                    // un-mute mid-answer once it happens to elapse.
+                    settling_since = None;
                     if !was_muted {
                         // Entering mute: finalize whatever was already
                         // heard so a half-decoded utterance doesn't sit in
                         // the decoder and bleed into audio heard after
-                        // Veronica stops talking.
-                        if let Err(err) = sidecar.flush() {
-                            log::warn!("mic assistant: failed to flush STT sidecar before muting for TTS: {err}");
+                        // Veronica stops talking — but ONLY if there's
+                        // plausibly a real utterance to finalize. See
+                        // `min_flush_worthy_audio`'s doc: an unconditional
+                        // flush here was the actual root cause of a false
+                        // "Thank you."-style user turn appearing from
+                        // ordinary ambient audio, independent of TTS
+                        // acoustic bleed and independent of the settle
+                        // window below (which guards un-muting, not this).
+                        let pending = sidecar.pending_audio_duration();
+                        if pending >= min_flush_worthy_audio() {
+                            if let Err(err) = sidecar.flush() {
+                                log::warn!("mic assistant: failed to flush STT sidecar before muting for TTS: {err}");
+                            }
+                        } else if pending > Duration::ZERO {
+                            // Too short to plausibly be real speech — discard
+                            // rather than flush, so it's neither sent to Groq
+                            // NOR left sitting in the decoder to contaminate
+                            // whatever the user says once unmuted again.
+                            log::info!("[STT_FLUSH_SKIPPED] reason=tts_speaking pending_ms={}", pending.as_millis());
+                            if let Err(err) = sidecar.discard_pending() {
+                                log::warn!("mic assistant: failed to discard pending STT audio before muting for TTS: {err}");
+                            }
                         }
                         was_muted = true;
                         loud_since = None;
+                        log::info!("[TTS_MUTE_STATE] source=mic muted=true reason=tts_speaking");
                         // Real "Veronica is speaking" signal for the orb
                         // widgets, piggybacked on this loop's existing
                         // per-chunk read of `tts_speaking` (already polled at
@@ -300,6 +400,7 @@ pub fn start_mic_assistant(
                             // the threshold, so this chunk is real speech,
                             // not TTS bleed.
                             was_muted = false;
+                            log::info!("[TTS_MUTE_STATE] source=mic muted=false reason=barge_in");
                             let _ = app_for_level.emit("tts:speaking-changed", false);
                             if let Err(err) = sidecar.send_samples(&chunk.samples) {
                                 log::warn!("mic assistant: failed to send audio to STT sidecar: {err}");
@@ -311,8 +412,30 @@ pub fn start_mic_assistant(
                     continue;
                 }
                 if was_muted {
+                    // TTS has genuinely stopped (is_speaking is false), but
+                    // stay muted a little longer to let Veronica's own
+                    // acoustic/electronic tail decay — see
+                    // `tts_settle_duration`'s doc for the exact failure this
+                    // prevents (her own trailing words transcribed and
+                    // answered as a new user turn). No barge-in scanning
+                    // during this window either: unlike the actively-speaking
+                    // case above, there is no live TTS to interrupt anymore,
+                    // so a loud chunk here is either the tail itself or the
+                    // user's real next utterance — either way, waiting the
+                    // (short) remainder of the window before listening again
+                    // is correct, not a barge-in decision.
+                    let is_first_settle_chunk = settling_since.is_none();
+                    let settle_start = settling_since.get_or_insert_with(Instant::now);
+                    if is_first_settle_chunk {
+                        log::info!("[TTS_MUTE_STATE] source=mic muted=true reason=settling settle_ms={}", settle_duration.as_millis());
+                    }
+                    if settle_start.elapsed() < settle_duration {
+                        continue;
+                    }
                     was_muted = false;
+                    settling_since = None;
                     loud_since = None;
+                    log::info!("[TTS_MUTE_STATE] source=mic muted=false reason=settle_elapsed");
                     let _ = app_for_level.emit("tts:speaking-changed", false);
                 }
                 if let Err(err) = sidecar.send_samples(&chunk.samples) {

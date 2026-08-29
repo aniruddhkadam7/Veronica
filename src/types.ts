@@ -67,6 +67,20 @@ export interface RecordingStateEvent {
 ///   synthetic/looping animation.
 export type VeronicaErrorEvent = string;
 
+/// A `Sensitive`/`Destructive` action Veronica is withholding until the user
+/// says yes/no — see veronica.rs's `ConfirmationRequestedPayload`. Emitted
+/// as "veronica:confirmation-requested" once per pending confirmation; the
+/// user can answer either by voice (the normal ask_veronica flow, resolved
+/// server-side via `confirmation::classify_reply`) or by clicking Yes/No in
+/// `ConfirmationDialog`, which calls the `respond_to_confirmation` command
+/// directly. `risk` is "sensitive" or "destructive" — see `useConfirmation`.
+export interface ConfirmationRequestedEvent {
+  turnId: string;
+  summary: string;
+  detail: string;
+  risk: "sensitive" | "destructive";
+}
+
 export type BackendStatus = "UNKNOWN" | "CONNECTING" | "CONNECTED" | "OFFLINE";
 
 export type AnalysisPhase = "IDLE" | "ANALYZING" | "COMPLETED" | "FAILED";

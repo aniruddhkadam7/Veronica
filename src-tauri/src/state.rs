@@ -85,6 +85,29 @@ impl SelectedDevices {
     }
 }
 
+/// User-selected Deepgram Flux voice model (e.g. `flux-sienna-en`) — see
+/// `tts::deepgram_flux::VOICES` for the full catalog. Read fresh by
+/// `TtsSession::start` each time a session opens (mirrors `SelectedDevices`),
+/// so a change here only takes effect on the next TTS session, not
+/// mid-answer.
+pub struct SelectedVoice(Mutex<String>);
+
+impl Default for SelectedVoice {
+    fn default() -> Self {
+        Self(Mutex::new(crate::tts::deepgram_flux::DEFAULT_VOICE.to_string()))
+    }
+}
+
+impl SelectedVoice {
+    pub fn get(&self) -> String {
+        self.0.lock().unwrap().clone()
+    }
+
+    pub fn set(&self, voice: String) {
+        *self.0.lock().unwrap() = voice;
+    }
+}
+
 /// Handles for an in-progress recording session, held so Tauri commands can stop it
 /// later. Wrapped in `Mutex` because Tauri commands run on arbitrary threads from
 /// the async runtime.
@@ -171,6 +194,29 @@ pub struct AppState {
     /// User-selected mic/speaker device, if any — see `SelectedDevices`'s
     /// doc. One instance for the whole app, like `mic_muted`/`tts_speaking`.
     pub selected_devices: SelectedDevices,
+    /// User-selected Deepgram Flux voice — see `SelectedVoice`'s doc.
+    pub selected_voice: SelectedVoice,
+    /// A `Sensitive`/`Destructive` capability withheld pending the user's
+    /// yes/no — set by `veronica::run_turn` when `execute_tool` returns
+    /// `ToolOutcome::NeedsConfirmation`, resolved by either the next turn's
+    /// voice reply (`confirmation::classify_reply`) or the overlay's
+    /// `respond_to_confirmation` command. `None` when nothing is pending.
+    pub pending_confirmation: Mutex<Option<crate::veronica::PendingConfirmation>>,
+    /// Pending scheduled one-off actions — see `actions::scheduler`.
+    pub scheduler: crate::actions::SchedulerRegistry,
+    /// Active filesystem watches — see `actions::watchers`.
+    pub watchers: crate::actions::WatcherRegistry,
+    /// The most recent `ask_veronica` call's question text and when it
+    /// arrived — backend defense-in-depth against two frontend windows
+    /// (the widget and the overlay, both listening to the same
+    /// `transcript:update` emit) independently deciding to submit the same
+    /// utterance near-simultaneously. See `try_claim_ask`. `None` between
+    /// calls. Distinct from `current_turn`/`CancelToken`, which supersedes
+    /// an OLDER turn with a NEWER one (both proceed); this instead REJECTS
+    /// a second call outright when it's a same-text duplicate arriving
+    /// within a short window, so only one call ever creates a turn for one
+    /// real utterance.
+    pub last_ask: Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl AppState {
@@ -201,5 +247,26 @@ impl AppState {
         if let Some(token) = self.current_turn.lock().unwrap().as_ref() {
             token.cancel();
         }
+    }
+
+    /// Returns `true` (and records this call) if `question` is NOT a
+    /// duplicate of the most recent `ask_veronica` call within `window` —
+    /// `false` means the caller must reject this call as a duplicate
+    /// without creating a turn. A single `Mutex` critical section so two
+    /// calls racing at the OS thread level still resolve to exactly one
+    /// winner, not a benign-looking but real TOCTOU race. `question` should
+    /// already be trimmed by the caller. Deliberately does NOT refresh the
+    /// stored timestamp on a rejected duplicate — a genuine third
+    /// near-simultaneous caller within the same original window is still
+    /// correctly treated as a dup of the FIRST, not given a fresh window.
+    pub fn try_claim_ask(&self, question: &str, window: std::time::Duration) -> bool {
+        let mut guard = self.last_ask.lock().unwrap();
+        if let Some((prev_text, prev_at)) = guard.as_ref() {
+            if prev_text == question && prev_at.elapsed() < window {
+                return false;
+            }
+        }
+        *guard = Some((question.to_string(), std::time::Instant::now()));
+        true
     }
 }

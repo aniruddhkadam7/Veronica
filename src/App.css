@@ -493,6 +493,50 @@ body.compact-transparent {
   background: var(--surface-alt);
 }
 
+/* Settings -> Audio voice picker: each option row pairs the voice's label
+   with a small preview button (Select's renderOption, see AudioSettingsPanel)
+   instead of plain text, so a voice can be auditioned before it's selected. */
+.voice-option-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.voice-option-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-preview-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color 0.12s ease, color 0.12s ease, background-color 0.12s ease;
+}
+
+.voice-preview-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.voice-preview-btn:disabled {
+  cursor: default;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* Custom dropdown replacing native <select> everywhere (see Select in
    ui.tsx) — a trigger button plus a floating .dropdown-item list, so every
    dropdown in the app shares one look instead of the OS's native popup

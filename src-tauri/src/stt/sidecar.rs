@@ -472,15 +472,61 @@ impl SttSidecar {
         write_frame(stdin, &bytes)
     }
 
+    /// How much audio (as a duration, at `TARGET_SAMPLE_RATE`) is currently
+    /// sitting in the not-yet-finalized utterance buffer — i.e. exactly what
+    /// `flush()` would force-finalize and ship to Groq if called right now.
+    /// Callers use this to decide whether a flush is worth triggering at
+    /// all: see `flush`'s doc for why an unconditional flush is unsafe.
+    pub fn pending_audio_duration(&self) -> Duration {
+        let sample_count = self.groq_utterance_buffer.lock().map(|buf| buf.len()).unwrap_or(0);
+        Duration::from_secs_f64(sample_count as f64 / TARGET_SAMPLE_RATE as f64)
+    }
+
     /// Sends the zero-length flush marker so the local engine finalizes any
     /// in-progress utterance immediately (used when the user pauses/stops
-    /// recording) — that finalization is what triggers sending the buffered
-    /// audio to Groq for this last utterance.
+    /// recording, or the mic is about to be muted for TTS) — that
+    /// finalization is what triggers sending the buffered audio to Groq for
+    /// this last utterance.
+    ///
+    /// The local engine has no real speech/non-speech judgment of its own
+    /// by default (`STT_VAD_GATE_ENABLED` is off — see `sidecar.py`'s
+    /// `PassThroughGate`), so ANY audio at all — room tone, a keyboard
+    /// click, mic self-noise — can leave it with an in-progress "utterance"
+    /// at the moment this is called. An unconditional flush would force-
+    /// finalize that fragment and send it to Groq, which can hallucinate a
+    /// short plausible phrase (e.g. "Thank you.") from marginal audio the
+    /// user never actually spoke. Callers MUST check `pending_audio_duration`
+    /// first and skip the flush when it's below a reasoned minimum — see
+    /// `voice_command::mod`'s mute-entry call site, which is exactly this
+    /// case (muting for TTS is not "the user paused mid-sentence," so a tiny
+    /// fragment there is far more likely to be noise than real speech).
     pub fn flush(&mut self) -> Result<(), String> {
         let Some(stdin) = self.stdin.as_mut() else {
             return Err("sidecar stdin already closed".into());
         };
         write_frame(stdin, &[])
+    }
+
+    /// Throws away whatever fragment of audio is currently in-progress in
+    /// the local decoder WITHOUT transcribing it — the counterpart to
+    /// `flush()` for exactly the case that method's doc warns about: a
+    /// too-short-to-be-real fragment (see `pending_audio_duration`) that
+    /// should never reach Groq at all, and must not be left sitting in the
+    /// decoder either (a stale fragment left in place would otherwise get
+    /// silently prepended to whatever real speech the user says once the
+    /// mic is un-muted again, corrupting that later, genuine utterance).
+    /// A one-byte frame on the wire — real audio frames are always an even
+    /// number of bytes (PCM16LE), so this is unambiguous against the
+    /// existing zero-byte flush marker and real audio, with no wire-format
+    /// version bump needed. See `sidecar.py`'s `DISCARD_MARKER` handler.
+    pub fn discard_pending(&mut self) -> Result<(), String> {
+        if let Ok(mut buf) = self.groq_utterance_buffer.lock() {
+            buf.clear();
+        }
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err("sidecar stdin already closed".into());
+        };
+        write_frame(stdin, &[0u8])
     }
 
     /// Closes stdin (signals end-of-stream) and waits for the process to exit.

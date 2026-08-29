@@ -120,7 +120,13 @@ pub fn transcribe(samples: &[f32], sample_rate: u32) -> Result<String, GroqError
     // its speech pre-gate disabled (see `stt::sidecar`'s doc on
     // `STT_VAD_GATE_ENABLED`), so this is a real, needed second check, not
     // a redundant one.
-    if crate::audio::compute_rms(samples) < MIN_SPEECH_RMS {
+    let rms = crate::audio::compute_rms(samples);
+    if rms < MIN_SPEECH_RMS {
+        // Distinguishes a silence-triggered empty final (this branch) from a
+        // genuine "user said nothing transcribable" case (Groq called, came
+        // back empty) in logs — requirement 10's confidence/completeness
+        // observability. Never logs audio content, only the RMS number.
+        log::info!("[STT_SILENCE_DISCARDED] rms={rms:.4}");
         return Ok(String::new());
     }
     let key = api_key()?;
@@ -189,7 +195,7 @@ pub fn transcribe(samples: &[f32], sample_rate: u32) -> Result<String, GroqError
         return Ok(text);
     }
     if is_likely_hallucination(&json) {
-        log::info!("Groq: discarding likely hallucinated transcript (low speech confidence): {text:?}");
+        log::info!("[STT_HALLUCINATION_DISCARDED] text={text:?}");
         return Ok(String::new());
     }
     Ok(text)

@@ -319,6 +319,7 @@ class SttRecognizer:
 # --------------------------------------------------------------------------
 
 FLUSH_MARKER = object()  # sentinel put on the queue for a zero-length frame
+DISCARD_MARKER = object()  # sentinel for a one-byte frame — see below
 EOF_MARKER = object()  # sentinel put on the queue when stdin closes
 
 
@@ -342,8 +343,14 @@ def stdin_reader_thread(out_queue: "queue.Queue") -> None:
             frame = read_frame(stdin)
             if frame is None:
                 break
+            # Real audio frames are always PCM16LE mono — an even number of
+            # bytes. A one-byte frame can never be valid audio, so it's an
+            # unambiguous second marker alongside the existing zero-byte
+            # flush marker, with no wire-format version bump needed.
             if len(frame) == 0:
                 out_queue.put(FLUSH_MARKER)
+            elif len(frame) == 1:
+                out_queue.put(DISCARD_MARKER)
             else:
                 out_queue.put(frame)
     except Exception:  # noqa: BLE001 - surfaced via EOF_MARKER, loop below logs it
@@ -448,6 +455,22 @@ def main() -> None:
                     while recognizer.is_ready(stream):
                         recognizer.decode_stream(stream)
                     finalize_current_utterance(time.monotonic())
+                continue
+
+            if item is DISCARD_MARKER:
+                # "Throw away whatever's in-progress, do NOT transcribe it" —
+                # distinct from FLUSH_MARKER, which always finalizes+emits.
+                # Used by the Rust side when it decides an in-progress
+                # fragment is too short to plausibly be real speech (e.g.
+                # ambient noise sitting in the decoder right as the mic is
+                # about to be muted for TTS) — resets decoder state exactly
+                # like a normal finalize does, just without ever calling
+                # Groq on it.
+                if has_pending_audio:
+                    recognizer.reset(stream)
+                    last_partial_text = ""
+                    utterance_start = None
+                    has_pending_audio = False
                 continue
 
             # Regular audio frame: raw PCM16LE mono bytes.

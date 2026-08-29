@@ -97,6 +97,44 @@ fn verb_family(first: &str, second: &str) -> Option<(VerbFamily, bool)> {
     }
 }
 
+/// Whole-word-boundary coordinating-conjunction markers that introduce a
+/// second, independent clause beyond a single app/path target — e.g. "open
+/// Notepad AND write something on it". Checked as whole-word matches (not a
+/// bare substring) so a real filename/app name that happens to CONTAIN one
+/// of these as part of a longer word (e.g. "sandbox.txt") is never
+/// false-split.
+const CLAUSE_BOUNDARY_MARKERS: &[&str] = &[" and then ", " and ", " then "];
+
+/// Returns true if `rest` (the OpenLaunch verb's full remainder) contains a
+/// second, independent clause beyond a single app/path target — a
+/// coordinating conjunction followed by more than a token or two of real
+/// content. When true, the fast router must bail (return `None`) rather
+/// than swallow the whole remainder as one literal `LaunchOrFocusApp`/
+/// `OpenPath` target — see requirement 7: "open Notepad and write something
+/// on it" must become a multi-step agent-loop task, not one mangled app
+/// name. Deliberately NOT a "second recognized verb" check: `verb_family`
+/// is scoped to app-control verbs only, and content-generation verbs like
+/// "write"/"create" are agent-loop-only by design, so a "second known verb"
+/// check would silently fail to catch exactly this example.
+fn has_second_clause(rest: &str) -> bool {
+    let lower = format!(" {} ", rest.trim().to_lowercase());
+    for marker in CLAUSE_BOUNDARY_MARKERS {
+        if let Some(idx) = lower.find(marker) {
+            let after = lower[idx + marker.len()..].trim().trim_end_matches(['.', '!', '?']);
+            // A bare noun-phrase continuation of an app name essentially
+            // never survives a real "and" split in practice (no real app is
+            // named "X and Y" that would trigger a false positive here) —
+            // requiring 2+ words after the marker distinguishes a real
+            // second clause ("write something on it") from a name that
+            // merely contains the marker as a whole word by coincidence.
+            if after.split_whitespace().count() >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn classify_open_target(rest: &str) -> Capability {
     let trimmed = rest.trim().trim_end_matches(['.', '!', '?']);
     let looks_like_path = trimmed.contains('\\')
@@ -212,7 +250,13 @@ pub fn try_match(text: &str) -> Option<Capability> {
     };
 
     match family {
-        VerbFamily::OpenLaunch => Some(classify_open_target(&rest)),
+        VerbFamily::OpenLaunch => {
+            if has_second_clause(&rest) {
+                None
+            } else {
+                Some(classify_open_target(&rest))
+            }
+        }
         VerbFamily::Close => Some(Capability::WindowOp { op: WindowOp::Close, target: non_empty(&rest) }),
         VerbFamily::Focus => Some(Capability::WindowOp { op: WindowOp::Focus, target: non_empty(&rest) }),
         VerbFamily::Minimize => Some(Capability::WindowOp { op: WindowOp::Minimize, target: non_empty(&rest) }),
@@ -334,5 +378,26 @@ mod tests {
     fn unrecognized_verb_falls_through() {
         assert_eq!(try_match("Tell me a joke"), None);
         assert_eq!(try_match("Why is the sky blue?"), None);
+    }
+
+    #[test]
+    fn multi_clause_open_and_write_bails_to_agent_loop() {
+        assert_eq!(try_match("Open Notepad and write something on it"), None);
+        assert_eq!(try_match("Can you please open Notepad and write something on it?"), None);
+    }
+
+    #[test]
+    fn multi_clause_open_then_verb_bails() {
+        assert_eq!(try_match("open Chrome then search for rust tutorials"), None);
+    }
+
+    #[test]
+    fn single_clause_open_with_and_in_filename_still_fast_routes() {
+        assert_eq!(try_match(r"open C:\Users\me\sandbox\notes.txt"), Some(Capability::OpenPath(r"C:\Users\me\sandbox\notes.txt".to_string())));
+    }
+
+    #[test]
+    fn single_clause_multiword_app_name_still_fast_routes() {
+        assert_eq!(try_match("open Visual Studio Code"), Some(Capability::LaunchOrFocusApp("Visual Studio Code".to_string())));
     }
 }
