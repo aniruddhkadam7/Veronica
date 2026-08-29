@@ -33,7 +33,18 @@ use profile::CpuUsageSampler;
 /// threads. `cpu_sampler` lives alongside the manager rather than inside
 /// its `Mutex` — it only ever needs a non-blocking atomic read (see
 /// `CpuUsageSampler::latest_percent`), so it doesn't need the same lock.
-pub struct PerformanceState(pub Mutex<PerformanceManager>, pub CpuUsageSampler);
+///
+/// `telemetry_history` is the Milestone 7 latency dashboard's in-memory ring
+/// buffer of recent turns (see `telemetry::TurnHistory`) — kept alongside
+/// the manager/sampler rather than in `AppState` since this module already
+/// owns `telemetry::PerfContext` production via `perf_context()`. It has its
+/// own internal `Mutex` (not covered by the outer one), so reading/clearing
+/// it never contends with a performance-mode change.
+pub struct PerformanceState {
+    pub manager: Mutex<PerformanceManager>,
+    pub cpu_sampler: CpuUsageSampler,
+    pub telemetry_history: telemetry::TurnHistory,
+}
 
 /// Detects hardware and loads the persisted mode preference. Called once
 /// from `lib.rs`'s `.setup()`, since loading the persisted mode needs an
@@ -70,7 +81,11 @@ pub fn init(app: &AppHandle) -> PerformanceState {
     let mut manager = PerformanceManager::new(profile, loaded.mode);
     manager.set_hardware_refreshed(loaded.hardware_changed);
     log::info!("performance mode: {:?}, detected tier: {:?}", manager.mode(), manager.detected_tier());
-    PerformanceState(Mutex::new(manager), CpuUsageSampler::start())
+    PerformanceState {
+        manager: Mutex::new(manager),
+        cpu_sampler: CpuUsageSampler::start(),
+        telemetry_history: telemetry::TurnHistory::new(),
+    }
 }
 
 /// Convenience for spawn-time call sites (Milestones 4b/5) that just need
@@ -79,7 +94,7 @@ pub fn init(app: &AppHandle) -> PerformanceState {
 /// `effective_config_checked` for the checkpoint-driven variant that does.
 pub fn effective_config(app: &AppHandle) -> manager::PerformanceConfig {
     let state = app.state::<PerformanceState>();
-    let manager = state.0.lock().unwrap();
+    let manager = state.manager.lock().unwrap();
     manager.effective_config()
 }
 
@@ -98,8 +113,8 @@ pub fn effective_config(app: &AppHandle) -> manager::PerformanceConfig {
 pub fn effective_config_checked(app: &AppHandle) -> manager::PerformanceConfig {
     let available = profile::available_ram_mb();
     let state = app.state::<PerformanceState>();
-    let cpu_percent = state.1.latest_percent();
-    let mut manager = state.0.lock().unwrap();
+    let cpu_percent = state.cpu_sampler.latest_percent();
+    let mut manager = state.manager.lock().unwrap();
     let (config, reason) = manager.effective_config_checked(available, cpu_percent);
     if let Some(reason) = reason {
         log::warn!("performance: {reason}");
@@ -112,8 +127,18 @@ pub fn effective_config_checked(app: &AppHandle) -> manager::PerformanceConfig {
 /// sample — safe to call from any pipeline-stage instrumentation point.
 pub fn perf_context(app: &AppHandle) -> telemetry::PerfContext {
     let state = app.state::<PerformanceState>();
-    let manager = state.0.lock().unwrap();
+    let manager = state.manager.lock().unwrap();
     manager.perf_context()
+}
+
+/// Records one turn's telemetry snapshot into the dashboard's in-memory
+/// history — a `Mutex` lock plus a bounded `VecDeque` push, no I/O. Safe to
+/// call from the voice-turn-completion path (`veronica::ask_veronica`)
+/// without adding any meaningful latency there, matching the same cost
+/// class as the other state locks already taken on that path.
+pub fn record_turn_telemetry(app: &AppHandle, snapshot: telemetry::TurnSnapshot) {
+    let state = app.state::<PerformanceState>();
+    state.telemetry_history.push(snapshot);
 }
 
 /// STT/RAG scheduling coordination (Phase B): whether active STT should
@@ -123,7 +148,7 @@ pub fn perf_context(app: &AppHandle) -> telemetry::PerfContext {
 /// on.
 pub fn should_throttle_background_work(app: &AppHandle) -> bool {
     let state = app.state::<PerformanceState>();
-    let manager = state.0.lock().unwrap();
+    let manager = state.manager.lock().unwrap();
     manager.should_throttle_background_work()
 }
 

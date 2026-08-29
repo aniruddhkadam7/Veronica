@@ -304,37 +304,184 @@ impl TurnTelemetry {
     /// (audio finished playing, or the fast-router path's confirmation
     /// finished).
     pub fn finish(&self, ctx: &PerfContext) {
-        let start = self.get(PipelineStage::MicDetected).or_else(|| self.get(PipelineStage::SpeechStarted));
-        let stages = self.stages.lock().unwrap();
-        let mut ordered: Vec<(&'static str, Instant)> = stages.iter().map(|(k, v)| (*k, *v)).collect();
-        drop(stages);
-        ordered.sort_by_key(|(_, at)| *at);
-        for (label, at) in &ordered {
-            if let Some(start) = start {
-                log::info!("perf: turn_id={} turn_stage={label} ms_since_turn_start={}", self.id, at.saturating_duration_since(start).as_millis());
-            }
+        let deltas = self.compute_deltas();
+        let ordered = self.ordered_stage_offsets();
+        for (label, ms_since_start) in &ordered {
+            log::info!("perf: turn_id={} turn_stage={label} ms_since_turn_start={ms_since_start}", self.id);
         }
-
-        let speech_to_stt_final = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::SttFinal);
-        let stt_final_to_router_decision = self.delta_ms(PipelineStage::SttFinal, PipelineStage::RouterDecision);
-        let stt_final_to_llm_first_token = self.delta_ms(PipelineStage::SttFinal, PipelineStage::LlmFirstToken);
-        let llm_first_token_to_tts_first_audio = self.delta_ms(PipelineStage::LlmFirstToken, PipelineStage::TtsFirstAudio);
-        let speech_end_to_first_audio = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::PlaybackStarted);
-        let total_turn_latency = self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete);
 
         log::info!(
             "perf: turn_id={} turn_summary speech_to_stt_final_ms={} stt_final_to_router_decision_ms={} stt_final_to_llm_first_token_ms={} llm_first_token_to_tts_first_audio_ms={} speech_end_to_first_audio_ms={} total_turn_latency_ms={} tier={:?} mode={:?} pressure={:?}",
             self.id,
-            fmt_opt(speech_to_stt_final),
-            fmt_opt(stt_final_to_router_decision),
-            fmt_opt(stt_final_to_llm_first_token),
-            fmt_opt(llm_first_token_to_tts_first_audio),
-            fmt_opt(speech_end_to_first_audio),
-            fmt_opt(total_turn_latency),
+            fmt_opt(deltas.speech_to_stt_final),
+            fmt_opt(deltas.stt_final_to_router_decision),
+            fmt_opt(deltas.stt_final_to_llm_first_token),
+            fmt_opt(deltas.llm_first_token_to_tts_first_audio),
+            fmt_opt(deltas.speech_end_to_first_audio),
+            fmt_opt(deltas.total_turn_latency),
             ctx.tier,
             ctx.mode,
             ctx.pressure,
         );
+    }
+
+    /// Every stage actually marked this turn, as `(label, ms since the
+    /// turn's start marker)` pairs, sorted chronologically. The "start
+    /// marker" is `MicDetected`, falling back to `SpeechStarted` — same rule
+    /// `finish()` has always used. A stage marked before `start` (should not
+    /// happen in practice, but not asserted against) still gets a value via
+    /// `saturating_duration_since`, never a negative/underflowed one.
+    fn ordered_stage_offsets(&self) -> Vec<(&'static str, u128)> {
+        let start = self.get(PipelineStage::MicDetected).or_else(|| self.get(PipelineStage::SpeechStarted));
+        let Some(start) = start else { return Vec::new() };
+        let stages = self.stages.lock().unwrap();
+        let mut ordered: Vec<(&'static str, Instant)> = stages.iter().map(|(k, v)| (*k, *v)).collect();
+        drop(stages);
+        ordered.sort_by_key(|(_, at)| *at);
+        ordered.into_iter().map(|(label, at)| (label, at.saturating_duration_since(start).as_millis())).collect()
+    }
+
+    /// The six requested end-to-end deltas, computed once so `finish()` and
+    /// `snapshot()` can never disagree on the numbers — each `None` unless
+    /// BOTH of its endpoint stages were actually marked this turn.
+    fn compute_deltas(&self) -> TurnDeltas {
+        TurnDeltas {
+            speech_to_stt_final: self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::SttFinal),
+            stt_final_to_router_decision: self.delta_ms(PipelineStage::SttFinal, PipelineStage::RouterDecision),
+            stt_final_to_llm_first_token: self.delta_ms(PipelineStage::SttFinal, PipelineStage::LlmFirstToken),
+            llm_first_token_to_tts_first_audio: self.delta_ms(PipelineStage::LlmFirstToken, PipelineStage::TtsFirstAudio),
+            speech_end_to_first_audio: self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::PlaybackStarted),
+            total_turn_latency: self.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete),
+        }
+    }
+
+    /// A point-in-time, read-only capture of this turn's stages and derived
+    /// deltas — for the latency dashboard's in-memory history. Never logs
+    /// (that stays `finish()`'s job) and never mutates `self`, so it is safe
+    /// to call from a non-voice-path command handler at any time, including
+    /// concurrently with `finish()` on the same turn.
+    pub fn snapshot(&self, ctx: &PerfContext) -> TurnSnapshot {
+        let deltas = self.compute_deltas();
+        let stage_ms_since_start =
+            self.ordered_stage_offsets().into_iter().map(|(label, ms)| (label.to_string(), ms as i64)).collect();
+        // A turn is "interrupted/incomplete" from the dashboard's point of
+        // view exactly when TurnComplete's own end-to-end delta could not be
+        // computed (SpeechEnded and/or TurnComplete never got marked) even
+        // though this snapshot is being taken — i.e. the turn was recorded
+        // without ever reaching a normal, fully-timed completion. This is
+        // read directly off already-marked stages, never inferred from a
+        // duration or threshold.
+        let interrupted = deltas.total_turn_latency.is_none();
+        let recorded_at_ms =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        TurnSnapshot {
+            turn_id: self.id.clone(),
+            stage_ms_since_start,
+            speech_to_stt_final_ms: deltas.speech_to_stt_final,
+            stt_final_to_router_decision_ms: deltas.stt_final_to_router_decision,
+            stt_final_to_llm_first_token_ms: deltas.stt_final_to_llm_first_token,
+            llm_first_token_to_tts_first_audio_ms: deltas.llm_first_token_to_tts_first_audio,
+            speech_end_to_first_audio_ms: deltas.speech_end_to_first_audio,
+            total_turn_latency_ms: deltas.total_turn_latency,
+            tier: format!("{:?}", ctx.tier),
+            mode: format!("{:?}", ctx.mode),
+            pressure: format!("{:?}", ctx.pressure),
+            recorded_at_ms,
+            interrupted,
+        }
+    }
+}
+
+/// The six requested end-to-end latency deltas, each `None` unless both of
+/// its endpoint stages were actually marked — shared by `finish()`'s log
+/// line and `snapshot()`'s dashboard record so the two can never drift.
+struct TurnDeltas {
+    speech_to_stt_final: Option<i64>,
+    stt_final_to_router_decision: Option<i64>,
+    stt_final_to_llm_first_token: Option<i64>,
+    llm_first_token_to_tts_first_audio: Option<i64>,
+    speech_end_to_first_audio: Option<i64>,
+    total_turn_latency: Option<i64>,
+}
+
+/// A point-in-time capture of one turn's real, measured telemetry — every
+/// field here is either a value read directly off a marked `Instant`
+/// (`stage_ms_since_start`), a delta between two such `Instant`s (the six
+/// `..._ms` fields, `None` when either endpoint was never marked), or
+/// `PerfContext`/id metadata already computed elsewhere. Nothing here is
+/// estimated, interpolated, or defaulted to zero.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSnapshot {
+    pub turn_id: String,
+    /// `(stage label, milliseconds since this turn's start marker)`,
+    /// chronologically sorted, containing ONLY stages that were actually
+    /// marked — a stage the pipeline never reached for this turn (e.g. no
+    /// LLM call on a fast-router turn) simply does not appear here, rather
+    /// than appearing with a fabricated value.
+    pub stage_ms_since_start: Vec<(String, i64)>,
+    pub speech_to_stt_final_ms: Option<i64>,
+    pub stt_final_to_router_decision_ms: Option<i64>,
+    pub stt_final_to_llm_first_token_ms: Option<i64>,
+    pub llm_first_token_to_tts_first_audio_ms: Option<i64>,
+    pub speech_end_to_first_audio_ms: Option<i64>,
+    pub total_turn_latency_ms: Option<i64>,
+    pub tier: String,
+    pub mode: String,
+    pub pressure: String,
+    /// Wall-clock capture time in ms since the Unix epoch — for ordering
+    /// and export display ONLY. Every duration above stays `Instant`-based
+    /// (monotonic); this field is never used in any duration computation.
+    pub recorded_at_ms: u64,
+    /// `true` when this turn never reached a normally-timed completion
+    /// (`total_turn_latency_ms` is `None` because `SpeechEnded` and/or
+    /// `TurnComplete` was never marked — e.g. a barge-in superseded it).
+    /// Dashboard aggregate stats must exclude these turns from their
+    /// populations rather than silently averaging in a missing value.
+    pub interrupted: bool,
+}
+
+/// A bounded, in-memory ring buffer of recent turns' telemetry snapshots for
+/// the latency dashboard. Deliberately capped (not unbounded growth) and
+/// deliberately NOT persisted to disk — see this module's top-level "No new
+/// persistence" rule; this stores the same kind of data `finish()` already
+/// logs, just retained in memory long enough for the dashboard to read it.
+/// `push`/`clear` are a `Mutex` lock plus a `VecDeque` operation — cheap and
+/// non-blocking, safe to call from the voice-turn-completion path.
+const HISTORY_CAPACITY: usize = 200;
+
+pub struct TurnHistory {
+    turns: std::sync::Mutex<std::collections::VecDeque<TurnSnapshot>>,
+}
+
+impl TurnHistory {
+    pub fn new() -> Self {
+        Self { turns: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(HISTORY_CAPACITY)) }
+    }
+
+    /// Records one turn's snapshot, evicting the oldest entry once at
+    /// capacity — never grows unbounded.
+    pub fn push(&self, snapshot: TurnSnapshot) {
+        let mut turns = self.turns.lock().unwrap();
+        if turns.len() >= HISTORY_CAPACITY {
+            turns.pop_back();
+        }
+        turns.push_front(snapshot);
+    }
+
+    /// All recorded turns, newest first — a plain clone, no computation.
+    pub fn snapshot_all(&self) -> Vec<TurnSnapshot> {
+        self.turns.lock().unwrap().iter().cloned().collect()
+    }
+
+    pub fn clear(&self) {
+        self.turns.lock().unwrap().clear();
+    }
+}
+
+impl Default for TurnHistory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -705,5 +852,109 @@ mod tests {
         log_stage_ms(PipelineStage::LlmFirstToken, 42, &ctx);
         let sw = Stopwatch::start();
         log_stage(&sw.stop(PipelineStage::LlmTotal), &ctx);
+    }
+
+    // -- TurnSnapshot / TurnHistory: the dashboard's read path --
+
+    #[test]
+    fn snapshot_computes_the_same_deltas_finish_would_log() {
+        let ctx = PerfContext::new(HardwareTier::Performance, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::MicDetected);
+        turn.mark(PipelineStage::SpeechEnded);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::SttFinal);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::RouterDecision);
+        turn.mark(PipelineStage::LlmFirstToken);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::TtsFirstAudio);
+        turn.mark(PipelineStage::PlaybackStarted);
+        std::thread::sleep(Duration::from_millis(2));
+        turn.mark(PipelineStage::TurnComplete);
+
+        let snap = turn.snapshot(&ctx);
+        assert_eq!(snap.turn_id, turn.id());
+        assert_eq!(snap.speech_to_stt_final_ms, turn.delta_ms(PipelineStage::SpeechEnded, PipelineStage::SttFinal));
+        assert_eq!(
+            snap.stt_final_to_router_decision_ms,
+            turn.delta_ms(PipelineStage::SttFinal, PipelineStage::RouterDecision)
+        );
+        assert_eq!(
+            snap.total_turn_latency_ms,
+            turn.delta_ms(PipelineStage::SpeechEnded, PipelineStage::TurnComplete)
+        );
+        assert!(!snap.interrupted, "a turn with TurnComplete marked from SpeechEnded must not be flagged interrupted");
+        // Every marked stage shows up in the ordered list, none fabricated.
+        let labels: Vec<&str> = snap.stage_ms_since_start.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"speech_ended"));
+        assert!(labels.contains(&"turn_complete"));
+        assert!(!labels.contains(&"stt_started"), "an unmarked stage must never appear in the snapshot");
+    }
+
+    #[test]
+    fn snapshot_leaves_unmarked_deltas_as_none_never_zero() {
+        // Mirrors a fast-router turn: no LLM/TTS stages ever get marked.
+        let ctx = PerfContext::new(HardwareTier::Entry, PerformanceMode::BatterySaver, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        turn.mark(PipelineStage::RouterDecision);
+        turn.mark(PipelineStage::TurnComplete);
+
+        let snap = turn.snapshot(&ctx);
+        assert!(snap.stt_final_to_llm_first_token_ms.is_none());
+        assert!(snap.llm_first_token_to_tts_first_audio_ms.is_none());
+        assert!(snap.stt_final_to_router_decision_ms.is_none(), "SttFinal was never marked in this scenario either");
+        assert!(snap.stt_final_to_router_decision_ms != Some(0));
+    }
+
+    #[test]
+    fn snapshot_flags_interrupted_when_total_latency_cannot_be_computed() {
+        let ctx = PerfContext::new(HardwareTier::Standard, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        // TurnComplete never marked — e.g. superseded by a barge-in.
+        let snap = turn.snapshot(&ctx);
+        assert!(snap.interrupted);
+        assert!(snap.total_turn_latency_ms.is_none());
+    }
+
+    #[test]
+    fn snapshot_does_not_consume_state_finish_can_still_be_called_after() {
+        let ctx = PerfContext::new(HardwareTier::Standard, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        turn.mark(PipelineStage::TurnComplete);
+        let _ = turn.snapshot(&ctx);
+        turn.finish(&ctx); // must not panic — snapshot() only reads, never mutates
+    }
+
+    #[test]
+    fn turn_history_returns_newest_first_and_evicts_oldest_at_capacity() {
+        let history = TurnHistory::new();
+        for i in 0..(HISTORY_CAPACITY + 5) {
+            let turn = TurnTelemetry::new();
+            turn.mark(PipelineStage::SpeechEnded);
+            turn.mark(PipelineStage::TurnComplete);
+            let ctx = PerfContext::new(HardwareTier::Standard, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+            let mut snap = turn.snapshot(&ctx);
+            snap.turn_id = format!("turn-{i}");
+            history.push(snap);
+        }
+        let all = history.snapshot_all();
+        assert_eq!(all.len(), HISTORY_CAPACITY, "must never grow past the fixed capacity");
+        assert_eq!(all[0].turn_id, format!("turn-{}", HISTORY_CAPACITY + 4), "newest turn must be first");
+    }
+
+    #[test]
+    fn turn_history_clear_empties_it() {
+        let history = TurnHistory::new();
+        let ctx = PerfContext::new(HardwareTier::Standard, PerformanceMode::Adaptive, PressureState::Normal, &sample_config());
+        let turn = TurnTelemetry::new();
+        turn.mark(PipelineStage::SpeechEnded);
+        history.push(turn.snapshot(&ctx));
+        assert_eq!(history.snapshot_all().len(), 1);
+        history.clear();
+        assert!(history.snapshot_all().is_empty());
     }
 }

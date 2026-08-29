@@ -3,6 +3,7 @@ import { PerformancePanel } from "./PerformancePanel";
 import { PersonalizationPanel } from "./PersonalizationPanel";
 import { AttachedDocumentsPanel } from "./AttachedDocumentsPanel";
 import { AudioSettingsPanel } from "./AudioSettingsPanel";
+import { LatencyDashboardPanel } from "./LatencyDashboardPanel";
 import { PersonalApiKeySettings } from "./PersonalApiKeySettings";
 import { WidgetPanel } from "./WidgetPanel";
 import type { PersonalLlmProvider } from "./personalApiKeys";
@@ -12,6 +13,7 @@ type SettingsSection =
   | "WIDGET"
   | "AUDIO"
   | "PERFORMANCE"
+  | "LATENCY"
   | "CONTEXT"
   | "API_KEYS"
   | "PRIVACY"
@@ -22,6 +24,7 @@ const SECTIONS: { key: SettingsSection; label: string }[] = [
   { key: "WIDGET", label: "Widget" },
   { key: "AUDIO", label: "Audio" },
   { key: "PERFORMANCE", label: "Performance" },
+  { key: "LATENCY", label: "Voice Latency" },
   { key: "CONTEXT", label: "Context / Documents" },
   { key: "API_KEYS", label: "API Keys" },
   { key: "PRIVACY", label: "Privacy" },
@@ -71,6 +74,7 @@ export function SettingsPopover({ onClose, onApiKeySaved }: Props) {
             {section === "WIDGET" && <WidgetPanel />}
             {section === "AUDIO" && <AudioSettingsPanel />}
             {section === "PERFORMANCE" && <PerformancePanel />}
+            {section === "LATENCY" && <LatencyDashboardPanel />}
             {section === "CONTEXT" && <AttachedDocumentsPanel />}
             {section === "API_KEYS" && <PersonalApiKeySettings onKeySaved={onApiKeySaved} />}
             {section === "PRIVACY" && (

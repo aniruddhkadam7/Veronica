@@ -2302,6 +2302,137 @@ body.compact-transparent {
   padding: 1rem;
 }
 
+/* ---------- Voice Latency dashboard (Settings > Voice Latency) ---------- */
+
+.latency-dashboard {
+  gap: 1.1rem;
+}
+
+.latency-actions {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.latency-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.9rem;
+}
+
+.latency-section:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.latency-section-title {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.latency-subsection-title {
+  margin: 0.3rem 0 0;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.latency-turn-id,
+.latency-turn-id-cell {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+}
+
+.latency-latest {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.latency-table-wrap {
+  overflow-x: auto;
+}
+
+.latency-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.latency-table th {
+  text-align: left;
+  color: var(--text-muted);
+  font-weight: 600;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.latency-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.latency-row {
+  cursor: pointer;
+}
+
+.latency-row:hover {
+  background-color: var(--surface-hover, rgba(0, 0, 0, 0.03));
+}
+
+.latency-row.selected {
+  background-color: var(--accent-soft);
+}
+
+.latency-badge-interrupted {
+  color: var(--danger);
+  font-weight: 600;
+  font-size: 0.74rem;
+}
+
+.latency-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.latency-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem 1rem;
+  font-size: 0.82rem;
+}
+
+.latency-stat-total {
+  font-weight: 600;
+}
+
+.latency-stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+  font-size: 0.82rem;
+  padding: 0.15rem 0;
+}
+
+.latency-stat-label {
+  color: var(--text);
+}
+
+.latency-stat-values {
+  color: var(--text-muted);
+}
+
+.latency-n {
+  color: var(--text-faint);
+}
+
 .hint.small {
   font-size: 0.78rem;
   padding: 0.4rem 0;

@@ -6,6 +6,7 @@ use crate::state::AppState;
 use super::manager::{PerformanceConfig, PerformanceMode};
 use super::profile::HardwareProfile;
 use super::store;
+use super::telemetry::TurnSnapshot;
 use super::tier::HardwareTier;
 use super::PerformanceState;
 
@@ -30,13 +31,13 @@ pub struct PerformanceModeInfo {
 
 #[tauri::command]
 pub fn get_hardware_profile(state: State<'_, PerformanceState>) -> Result<HardwareProfile, String> {
-    let manager = state.0.lock().map_err(|e| e.to_string())?;
+    let manager = state.manager.lock().map_err(|e| e.to_string())?;
     Ok(manager.profile().clone())
 }
 
 #[tauri::command]
 pub fn get_performance_mode(state: State<'_, PerformanceState>) -> Result<PerformanceModeInfo, String> {
-    let manager = state.0.lock().map_err(|e| e.to_string())?;
+    let manager = state.manager.lock().map_err(|e| e.to_string())?;
     Ok(PerformanceModeInfo {
         mode: manager.mode(),
         detected_tier: manager.detected_tier(),
@@ -75,7 +76,7 @@ pub async fn set_performance_mode(
     mode: PerformanceMode,
 ) -> Result<(), String> {
     let embed_config = {
-        let mut manager = performance.0.lock().map_err(|e| e.to_string())?;
+        let mut manager = performance.manager.lock().map_err(|e| e.to_string())?;
         store::save_mode(&app, mode, &manager.hardware_fingerprint())?;
         manager.set_mode(mode);
         // The user just made an explicit choice on THIS machine — any
@@ -114,5 +115,26 @@ pub async fn set_performance_mode(
         tauri::async_runtime::spawn_blocking(crate::rag::wait_until_healthy_default);
     }
 
+    Ok(())
+}
+
+/// Returns the latency dashboard's in-memory turn history, newest first —
+/// a plain clone of whatever `hardware::record_turn_telemetry` has pushed
+/// from real completed voice turns. No computation happens here; averages/
+/// percentiles/bottleneck analysis are derived client-side from this exact
+/// array so every number the dashboard shows can be checked against these
+/// same rows.
+#[tauri::command]
+pub fn get_turn_telemetry_history(state: State<'_, PerformanceState>) -> Result<Vec<TurnSnapshot>, String> {
+    Ok(state.telemetry_history.snapshot_all())
+}
+
+/// Clears the latency dashboard's in-memory turn history. Only touches
+/// `PerformanceState::telemetry_history`'s own mutex — never the STT/TTS/
+/// conversation state on `AppState`, so this can never block or interfere
+/// with an in-progress voice turn.
+#[tauri::command]
+pub fn clear_turn_telemetry(state: State<'_, PerformanceState>) -> Result<(), String> {
+    state.telemetry_history.clear();
     Ok(())
 }
